@@ -1,0 +1,3 @@
+- insert:
+    - id: concept-explainer
+      name: '@local/dsh-concept-explainer'
