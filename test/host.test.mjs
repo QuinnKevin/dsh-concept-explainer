@@ -121,11 +121,17 @@ function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail, attachFail }
           resolveByPath: async (path) => {
             calls.push({ kind: 'resolveWorkspace', path })
             if (attachFail !== undefined) throw attachFail
-            return {
+            const workspace = {
+              sessionIds: ['session-oldest'],
               attachSession: async (sessionId) => {
                 calls.push({ kind: 'attach', sessionId })
+                workspace.sessionIds = [sessionId, ...workspace.sessionIds]
+              },
+              insertSessionBefore: async (sessionId, beforeSessionId) => {
+                calls.push({ kind: 'moveToTop', sessionId, beforeSessionId })
               },
             }
+            return workspace
           },
         }
       }
@@ -516,11 +522,15 @@ test('the session endpoint seeds a titled session through the agent factory', as
   const renamed = calls.find(call => call.kind === 'rename')
   assert.deepEqual(renamed.request, { sessionId: body.sessionId, title: 'MoE 路由' })
 
-  // The session must join the conversation's workspace, not "ungrouped".
+  // The session must join the conversation's workspace, not "ungrouped",
+  // and sit at the first row.
   const resolved = calls.find(call => call.kind === 'resolveWorkspace')
   assert.equal(resolved.path, 'C:\\ws')
   const attached = calls.find(call => call.kind === 'attach')
   assert.equal(attached.sessionId, body.sessionId)
+  const moved = calls.find(call => call.kind === 'moveToTop')
+  assert.equal(moved.sessionId, body.sessionId)
+  assert.equal(moved.beforeSessionId, 'session-oldest')
 })
 
 test('a workspace attach failure still returns the created session', async () => {
