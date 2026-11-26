@@ -25,6 +25,10 @@ window.__ModuleLoader__.load({
     const SAVE_ENDPOINT = 'api/concept-explainer/save'
     /** Host endpoint that turns the panel's transcript into a real session. */
     const SESSION_ENDPOINT = 'api/concept-explainer/session'
+    /** Host endpoint that appends a later follow-up to the saved session. */
+    const APPEND_ENDPOINT = 'api/concept-explainer/append'
+    /** Host endpoint that reads the saved session's transcript back. */
+    const TRANSCRIPT_ENDPOINT = 'api/concept-explainer/transcript'
 
     const zh = {
       explain: '解释此概念',
@@ -61,6 +65,7 @@ window.__ModuleLoader__.load({
       sessionSaving: '创建中…',
       sessionSaved: '已创建会话「{title}」',
       sessionFailed: '创建会话失败：{message}',
+      linkedTo: '已连接会话「{title}」，两边的追问会同步',
     }
 
     const en = {
@@ -98,6 +103,7 @@ window.__ModuleLoader__.load({
       sessionSaving: 'Creating…',
       sessionSaved: 'Created session “{title}”',
       sessionFailed: 'Could not create the session: {message}',
+      linkedTo: 'Linked to “{title}”; follow-ups in either place stay in sync',
     }
 
     const CSS = [
@@ -135,7 +141,7 @@ window.__ModuleLoader__.load({
       '.dce-ref{display:flex;flex-direction:column;gap:2px;margin:6px 0 0;padding:7px 9px;border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary)}',
       '.dce-ref-role{font-size:10.5px}',
       '.dce-ref-text{font-size:11.5px;line-height:1.55;word-break:break-word}',
-      '.dce-compose{position:sticky;bottom:0;display:flex;flex-direction:column;gap:8px;padding:10px 16px 14px;border-top:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-specific-sidebar-fill);flex:none}',
+      '.dce-compose{display:flex;flex-direction:column;gap:8px;padding:10px 16px 14px;border-top:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-specific-sidebar-fill);flex:none}',
       '.dce-input{box-sizing:border-box;width:100%;resize:none;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.5}',
       '.dce-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
       '.dce-actions{display:flex;justify-content:flex-end;gap:8px}',
@@ -375,6 +381,9 @@ window.__ModuleLoader__.load({
       const [draftSystem, setDraftSystem] = React.useState('')
       const [saveState, setSaveState] = React.useState({ kind: 'idle', text: '' })
       const [sessionState, setSessionState] = React.useState({ kind: 'idle', text: '' })
+      const [linked, setLinked] = React.useState('')
+      const linkedRef = React.useRef('')
+      const syncingRef = React.useRef(false)
       const turnsRef = React.useRef([])
       const abortRef = React.useRef(null)
       const startedRef = React.useRef('')
@@ -383,6 +392,11 @@ window.__ModuleLoader__.load({
       const commit = React.useCallback((next) => {
         turnsRef.current = next
         setTurns(next)
+      }, [])
+
+      const linkSession = React.useCallback((id) => {
+        linkedRef.current = id
+        setLinked(id)
       }, [])
 
       const stream = React.useCallback(async (conceptText, question) => {
@@ -469,6 +483,28 @@ window.__ModuleLoader__.load({
           }
           commit(finished)
           setStatus('done')
+          // A linked panel keeps its saved session current: append the
+          // exchange we just produced, so the conversation shows it too.
+          if (question !== '' && linkedRef.current !== '' && text.trim() !== '') {
+            syncingRef.current = true
+            try {
+              await fetch(new URL(APPEND_ENDPOINT, document.baseURI).href, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  sessionId: linkedRef.current,
+                  turns: [
+                    { role: 'user', text: question },
+                    { role: 'assistant', text },
+                  ],
+                }),
+              })
+            } catch {
+              // The panel keeps its own copy; the next poll reports the gap.
+            } finally {
+              syncingRef.current = false
+            }
+          }
         } catch (failure) {
           const aborted = failure?.name === 'AbortError'
           const finished = turnsRef.current.slice()
@@ -493,6 +529,7 @@ window.__ModuleLoader__.load({
           setError('')
           setSaveState({ kind: 'idle', text: '' })
           setSessionState({ kind: 'idle', text: '' })
+          linkSession('')
           return
         }
         const key = `${nonce}\u0000${concept}`
@@ -504,8 +541,9 @@ window.__ModuleLoader__.load({
         setDraft('')
         setSaveState({ kind: 'idle', text: '' })
         setSessionState({ kind: 'idle', text: '' })
+        linkSession('')
         void stream(concept, '')
-      }, [concept, nonce, commit, stream])
+      }, [concept, nonce, commit, stream, linkSession])
 
       React.useEffect(() => () => {
         if (abortRef.current !== null) abortRef.current.abort()
@@ -518,6 +556,44 @@ window.__ModuleLoader__.load({
           anchor.scrollIntoView({ block: 'nearest' })
         }
       }, [turns, status])
+
+      // While linked, the saved session is the source of truth for content
+      // added elsewhere (the user typing in that conversation). Polling keeps
+      // both places showing the same exchange without a second chat engine.
+      React.useEffect(() => {
+        if (linked === '' || status === 'streaming') return
+        let cancelled = false
+        const intro = concept === '' ? '' : `请解释「${concept}」。`
+        const pull = async () => {
+          if (cancelled || syncingRef.current) return
+          try {
+            const response = await fetch(new URL(TRANSCRIPT_ENDPOINT, document.baseURI).href, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sessionId: linked }),
+            })
+            if (!response.ok) return
+            const result = await response.json()
+            if (cancelled || result?.live !== true || !Array.isArray(result.turns)) return
+            let rows = result.turns.filter(row => typeof row?.text === 'string' && row.text.trim() !== '')
+            // The saved session opens with the synthetic concept question;
+            // the panel keeps the concept in its header instead.
+            if (rows.length > 0 && rows[0].role === 'user' && rows[0].text.trim() === intro) rows = rows.slice(1)
+            if (rows.length === 0) return
+            const current = turnsRef.current.map(row => `${row.role}\u0000${row.text}`).join('\n')
+            const next = rows.map(row => `${row.role}\u0000${row.text}`).join('\n')
+            if (current !== next) commit(rows.map(row => ({ role: row.role, text: row.text })))
+          } catch {
+            // A missed poll leaves the panel as it is.
+          }
+        }
+        void pull()
+        const timer = setInterval(() => { void pull() }, 4000)
+        return () => {
+          cancelled = true
+          clearInterval(timer)
+        }
+      }, [linked, status, commit, concept])
 
       const streaming = status === 'streaming'
       const submit = () => {
@@ -605,6 +681,7 @@ window.__ModuleLoader__.load({
           }
           const createdId = typeof result?.sessionId === 'string' ? result.sessionId : ''
           setSessionState({ kind: 'created', text: concept })
+          if (createdId !== '') linkSession(createdId)
           if (createdId !== '' && typeof openSession === 'function') openSession(createdId)
         } catch (failure) {
           setSessionState({
@@ -648,9 +725,11 @@ window.__ModuleLoader__.load({
         saveState.kind === 'error'
           ? h('div', { className: 'dce-save-error' }, t('saveFailed', { message: saveState.text }))
           : null,
-        sessionState.kind === 'created'
-          ? h('div', { className: 'dce-save-line' }, t('sessionSaved', { title: sessionState.text }))
-          : null,
+        linked !== ''
+          ? h('div', { className: 'dce-save-line' }, t('linkedTo', { title: sessionState.text !== '' ? sessionState.text : concept }))
+          : sessionState.kind === 'created'
+            ? h('div', { className: 'dce-save-line' }, t('sessionSaved', { title: sessionState.text }))
+            : null,
         sessionState.kind === 'error'
           ? h('div', { className: 'dce-save-error' }, t('sessionFailed', { message: sessionState.text }))
           : null)

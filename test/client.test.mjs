@@ -346,4 +346,7 @@ test('the stylesheet only references host theme tokens', () => {
   assert.deepEqual(colors, [], `literal colors must come from theme tokens: ${colors.join(', ')}`)
   assert.match(source, /--dsw-alias-label-primary/u)
   assert.match(source, /--dsw-specific-sidebar-fill/u)
+  // The panel is one flow: a sticky composer floated over the transcript and
+  // split the answer around itself.
+  assert.equal(source.includes('position:sticky'), false)
 })

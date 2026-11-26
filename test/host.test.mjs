@@ -9,7 +9,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { handleRequest, handleSave, handleSessionSave, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH, SESSION_ROUTE_PATH } from '../index.js'
+import { handleAppend, handleRequest, handleSave, handleSessionSave, handleTranscript, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH, SESSION_ROUTE_PATH, APPEND_ROUTE_PATH, TRANSCRIPT_ROUTE_PATH } from '../index.js'
 import {
   buildRequestMessages,
   buildTranscriptSeed,
@@ -17,6 +17,8 @@ import {
   composeSystemPrompt,
   noteFileName,
   renderNoteMarkdown,
+  turnsFromMessages,
+  validateAppendPayload,
   validatePayload,
   validateSavePayload,
 } from '../prompt.js'
@@ -96,6 +98,46 @@ function sessionRequest(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+/** Build a real Request for the append endpoint. */
+function appendRequest(body) {
+  return new Request(`http://127.0.0.1:7362${APPEND_ROUTE_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+/** Build a real Request for the transcript endpoint. */
+function transcriptRequest(body) {
+  return new Request(`http://127.0.0.1:7362${TRANSCRIPT_ROUTE_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+/** A fake host context whose saved session records every appended event. */
+function fakeAppendContext({ live = true, lastTurn = 3, messages = [user('问'), assistant('答')] } = {}) {
+  const appends = []
+  const session = {
+    append(type, data, options) {
+      appends.push({ type, data, options })
+      return { type, seq: appends.length - 1 }
+    },
+    deriveMessages: () => messages,
+  }
+  const ctx = {
+    get(name) {
+      if (name === 'sessions') return { get: () => (live ? session : undefined) }
+      if (name === 'sessionController') return { resolveAgent: async () => ({ agent: { id: 's' } }) }
+      if (name === 'agents') return { turnBoundaryOf: () => ({ lastTurn }) }
+      if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+      return undefined
+    },
+  }
+  return { ctx, appends }
 }
 
 /** A fake host context for session creation: records what the agent factory receives. */
@@ -443,6 +485,66 @@ test('a session without a workspace directory is refused', async () => {
   }))
   assert.equal(response.status, 409)
   assert.match((await response.json()).error, /工作区/u)
+})
+
+test('turnsFromMessages keeps only user and assistant text', () => {
+  const turns = turnsFromMessages([
+    user('问题'),
+    { role: 'tool', content: [{ type: 'text', text: '工具输出' }] },
+    { role: 'assistant', content: [{ type: 'reasoning', text: '想' }, { type: 'text', text: '回答' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c', name: 'x', arguments: '{}' }] },
+  ])
+  assert.deepEqual(turns, [{ role: 'user', text: '问题' }, { role: 'assistant', text: '回答' }])
+})
+
+test('validateAppendPayload requires a matched pair', () => {
+  assert.match(validateAppendPayload({ sessionId: 's', turns: [] }), /缺少/u)
+  assert.match(validateAppendPayload({ sessionId: 's', turns: [{ role: 'user', text: 'q' }] }), /一问一答/u)
+  assert.equal(validateAppendPayload({
+    sessionId: 's',
+    turns: [{ role: 'user', text: 'q' }, { role: 'assistant', text: 'a' }],
+  }), undefined)
+})
+
+test('the append endpoint adds one completed turn to the saved session', async () => {
+  const { ctx, appends } = fakeAppendContext({ lastTurn: 3 })
+  const response = await handleAppend(ctx, appendRequest({
+    sessionId: 'session-saved',
+    turns: [{ role: 'user', text: '再问一句' }, { role: 'assistant', text: '再答一句' }],
+  }))
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { appended: 2 })
+  assert.deepEqual(appends.map(row => row.type), [
+    'turn/start',
+    'step/start',
+    'user/message',
+    'assistant/message',
+    'step/end',
+    'turn/end',
+  ])
+  assert.equal(appends[0].data.turn, 4)
+  assert.equal(appends[2].options.surfaceOp, 'append')
+  assert.equal(appends[3].data.message.content[0].text, '再答一句')
+  assert.deepEqual(appends[5].data.reason, { kind: 'completed' })
+})
+
+test('the append endpoint refuses a session that cannot be resumed', async () => {
+  const { ctx } = fakeAppendContext({ live: false })
+  const response = await handleAppend(ctx, appendRequest({
+    sessionId: 'session-cold',
+    turns: [{ role: 'user', text: 'q' }, { role: 'assistant', text: 'a' }],
+  }))
+  assert.equal(response.status, 409)
+})
+
+test('the transcript endpoint projects the saved session', async () => {
+  const { ctx } = fakeAppendContext()
+  const response = await handleTranscript(ctx, transcriptRequest({ sessionId: 'session-saved' }))
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), {
+    live: true,
+    turns: [{ role: 'user', text: '问' }, { role: 'assistant', text: '答' }],
+  })
 })
 
 test('buildTranscriptSeed emits one complete turn per exchange', () => {

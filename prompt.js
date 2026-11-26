@@ -46,6 +46,48 @@ function normalize(text) {
 }
 
 /**
+ * Project derived session messages into the panel's two-role transcript.
+ * @param messages - `session.deriveMessages()`.
+ * @returns user/assistant text rows, oldest first.
+ */
+export function turnsFromMessages(messages) {
+  const rows = []
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role !== 'user' && message?.role !== 'assistant') continue
+    const text = messageText(message)
+    if (text === '') continue
+    rows.push({ role: message.role, text })
+  }
+  return rows
+}
+
+/**
+ * Validate one append payload: follow-up turns to add to a saved session.
+ * @param payload - parsed JSON body from the browser.
+ * @returns a human-readable rejection, or undefined when acceptable.
+ */
+export function validateAppendPayload(payload) {
+  if (payload === null || typeof payload !== 'object') return '请求格式不正确'
+  if (typeof payload.sessionId !== 'string' || payload.sessionId === '') return '缺少会话标识'
+  if (!Array.isArray(payload.turns) || payload.turns.length === 0) return '缺少要同步的内容'
+  if (payload.turns.length > 6) return '一次同步的内容过多'
+  let total = 0
+  let asked = 0
+  let answered = 0
+  for (const row of payload.turns) {
+    if (row === null || typeof row !== 'object') return '内容格式不正确'
+    if (row.role !== 'user' && row.role !== 'assistant') return '内容格式不正确'
+    if (typeof row.text !== 'string' || row.text.trim() === '') return '内容格式不正确'
+    if (row.role === 'user') asked += 1
+    else answered += 1
+    total += row.text.length
+  }
+  if (asked === 0 || answered === 0) return '同步内容必须包含一问一答'
+  if (total > MAX_NOTE_CHARS) return '内容过长'
+  return undefined
+}
+
+/**
  * Locate the message the user selected text from and take its neighbourhood.
  * @param messages - derived session messages, oldest first.
  * @param concept - the selected text.

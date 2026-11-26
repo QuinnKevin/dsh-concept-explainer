@@ -19,6 +19,8 @@ import {
   noteFileName,
   NOTE_FOLDER,
   renderNoteMarkdown,
+  turnsFromMessages,
+  validateAppendPayload,
   validatePayload,
   validateSavePayload,
 } from './prompt.js'
@@ -31,6 +33,12 @@ export const SAVE_ROUTE_PATH = '/api/concept-explainer/save'
 
 /** The route that turns one finished conversation into a real Session. */
 export const SESSION_ROUTE_PATH = '/api/concept-explainer/session'
+
+/** The route that appends a later follow-up to an already saved session. */
+export const APPEND_ROUTE_PATH = '/api/concept-explainer/append'
+
+/** The route that reads a saved session's transcript back into the panel. */
+export const TRANSCRIPT_ROUTE_PATH = '/api/concept-explainer/transcript'
 
 /** Largest request body accepted (the panel's own transcript is small). */
 const MAX_BODY_BYTES = 256 * 1024
@@ -448,6 +456,123 @@ export async function handleSessionSave(ctx, request) {
 }
 
 /**
+ * Resolve one live session, resuming its agent when it went cold.
+ * @param ctx - host context.
+ * @param sessionId - the saved session.
+ * @returns the live session, or undefined when it cannot be resumed.
+ */
+async function liveSessionOf(ctx, sessionId) {
+  const sessions = ctx.get('sessions')
+  const live = sessions?.get(sessionId)
+  if (live !== undefined) return live
+  try {
+    await ctx.get('sessionController')?.resolveAgent?.(sessionId)
+  } catch {
+    return undefined
+  }
+  return sessions?.get(sessionId)
+}
+
+/**
+ * Append one later follow-up exchange to an already saved session, so the
+ * panel and the session stay the same conversation.
+ * @param ctx - host context.
+ * @param request - the buffered Fetch request.
+ * @returns the appended message count, or a JSON error response.
+ */
+export async function handleAppend(ctx, request) {
+  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
+  let payload
+  try {
+    payload = JSON.parse(await request.text())
+  } catch {
+    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
+  }
+  const invalid = validateAppendPayload(payload)
+  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
+
+  const session = await liveSessionOf(ctx, payload.sessionId)
+  if (session === undefined) {
+    return jsonResponse(409, { error: '这个会话当前不在运行，暂时无法同步' })
+  }
+
+  const route = resolveRoute(ctx, payload.sessionId)
+  const source = {
+    kind: 'model',
+    provider: typeof route?.provider === 'string' ? route.provider : 'unknown',
+    model: typeof route?.model === 'string' ? route.model : 'unknown',
+  }
+  let turn = 1
+  try {
+    turn = (ctx.get('agents')?.turnBoundaryOf?.(session)?.lastTurn ?? 0) + 1
+  } catch {
+    turn = 1
+  }
+
+  let appended = 0
+  try {
+    session.append('turn/start', { turn })
+    session.append('step/start', { turn, step: 1 })
+    for (const row of payload.turns) {
+      if (row.role === 'user') {
+        session.append('user/message', {
+          role: 'user',
+          content: [{ type: 'text', text: row.text.trim() }],
+          source: { kind: 'user' },
+          id: randomUUID(),
+        }, { surfaceOp: 'append' })
+      } else {
+        session.append('assistant/message', {
+          turn,
+          step: 1,
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: row.text.trim() }],
+            source,
+            id: randomUUID(),
+          },
+          stream: [],
+        }, { surfaceOp: 'append' })
+      }
+      appended += 1
+    }
+    session.append('step/end', { turn, step: 1 })
+    session.append('turn/end', { turn, reason: { kind: 'completed' } })
+  } catch (error) {
+    return jsonResponse(500, { error: `同步到会话失败：${describeError(error)}` })
+  }
+  return jsonResponse(200, { appended })
+}
+
+/**
+ * Read a saved session's transcript, so the panel reflects activity that
+ * happened in the conversation itself.
+ * @param ctx - host context.
+ * @param request - the buffered Fetch request.
+ * @returns the two-role transcript, or a JSON error response.
+ */
+export async function handleTranscript(ctx, request) {
+  let payload
+  try {
+    payload = JSON.parse(await request.text())
+  } catch {
+    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
+  }
+  if (payload === null || typeof payload !== 'object' || typeof payload.sessionId !== 'string') {
+    return jsonResponse(400, { error: '缺少会话标识' })
+  }
+  const session = ctx.get('sessions')?.get(payload.sessionId)
+  if (session === undefined) return jsonResponse(200, { live: false, turns: [] })
+  let turns = []
+  try {
+    turns = turnsFromMessages(session.deriveMessages())
+  } catch (error) {
+    return jsonResponse(500, { error: `读取会话失败：${describeError(error)}` })
+  }
+  return jsonResponse(200, { live: true, turns })
+}
+
+/**
  * Host plugin body: own the panel's `/api` routes for its lifetime.
  * @param ctx - host context.
  */
@@ -461,6 +586,8 @@ export function apply(ctx) {
     { path: ROUTE_PATH, fetch: request => handleRequest(ctx, request) },
     { path: SAVE_ROUTE_PATH, fetch: request => handleSave(ctx, request) },
     { path: SESSION_ROUTE_PATH, fetch: request => handleSessionSave(ctx, request) },
+    { path: APPEND_ROUTE_PATH, fetch: request => handleAppend(ctx, request) },
+    { path: TRANSCRIPT_ROUTE_PATH, fetch: request => handleTranscript(ctx, request) },
   ]
   for (const route of routes) {
     const registered = connection.fetch.register({
