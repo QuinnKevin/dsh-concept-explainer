@@ -19,13 +19,14 @@
 
 ## 存成会话
 
-一段解释如果值得继续讨论，点「存为会话」会在左侧会话列表里建一个新会话：
+一段解释如果值得继续讨论，点「存为会话」会：
 
-- 会话内容就是这段解释：概念提问、解释正文、每一轮追问和回答
-- 自动切到那个会话，可以立刻接着问，就像 DSH 原生的分支
-- 会话标题用你选中的概念，方便在列表里找
-- 和「保存」的区别：保存写的是一份 Markdown 文件，存为会话建的是一段真会话，能继续对话
-- 创建失败时面板会显示原因，不会留下半个会话
+- 对当前对话做一次**原生分支**：完整复制主对话历史，DSH 注入的上下文（AGENTS.md、运行时信息、system-reminder）一并带上
+- 把面板里的这段解释（解释正文、每轮追问和回答）作为分支的下一段追加进去
+- 自动切到分支，可以直接接着聊
+- 会话标题用你选中的概念，太长会截断
+- 和「保存」的区别：保存写的是一份 Markdown 文件，存为会话建的是一段能继续对话的真会话
+- 存过之后按钮变成「已存为会话」，不能重复存；连接信息在鼠标悬停提示里
 
 ## 保存到工作区
 
@@ -54,7 +55,7 @@
 | 解释生成 | `index.js` | `ctx.connection.fetch.register` + `ctx.llm.stream`（沿用当前会话的模型；没有就用默认模型） |
 | 语境提取 | `prompt.js` | `ctx.sessions.get(id).deriveMessages()`，只读 |
 | 保存到工作区 | `index.js` | 用 Node 的 `fs` 写 `<会话 cwd>/concept-notes/*.md`；目标目录由宿主固定，请求不能指定路径 |
-| 存为新会话 | `index.js` | `ctx.agents.create` 把这段对话作为种子交给 DSH 的 agent 工厂；`ctx.sessionController.rename` 起标题，客户端 `uiWorkspace.openSession` 打开它 |
+| 存为新会话 | `index.js` | `sessionController.fork` 复制当前对话（含注入上下文），再把面板的解释追加为一轮；客户端 `uiWorkspace.openSession` 打开它 |
 | 自定义提示词 | `client.js` + `index.js` | 浏览器 `localStorage` 存用户改写的系统提示词，随请求发送；宿主留空时回退内置规则 |
 
 `index.js` 与 `prompt.js` 不导入任何 Harness 包，纯 ESM + 平台原生 `Request`/`Response`/`ReadableStream`。

@@ -13,7 +13,6 @@ import { mkdir, realpath, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import {
   buildRequestMessages,
-  buildTranscriptSeed,
   collectSnippets,
   composeSystemPrompt,
   noteFileName,
@@ -356,102 +355,6 @@ export async function handleSave(ctx, request) {
 }
 
 /**
- * Turn one finished panel conversation into a real Session: the panel's
- * transcript becomes the new session's seed, so it opens as an ordinary
- * conversation in the left list and can be continued there.
- * @param ctx - host context.
- * @param request - the buffered Fetch request.
- * @returns the new session id, or a JSON error response.
- */
-export async function handleSessionSave(ctx, request) {
-  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
-  let payload
-  try {
-    payload = JSON.parse(await request.text())
-  } catch {
-    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
-  }
-  const invalid = validateSavePayload(payload)
-  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
-
-  const agents = ctx.get('agents')
-  if (agents === undefined || typeof agents.create !== 'function') {
-    return jsonResponse(503, { error: '当前部署不能创建会话' })
-  }
-
-  const source = ctx.get('sessions')?.get(payload.sessionId)
-  const cwd = typeof source?.header?.cwd === 'string' && source.header.cwd !== '' ? source.header.cwd : undefined
-  const preset = typeof source?.header?.agentPreset === 'string' ? source.header.agentPreset : undefined
-  const route = resolveRoute(ctx, payload.sessionId)
-  const concept = payload.concept.trim()
-  const sessionId = `session-${randomUUID()}`
-  const createdAt = Date.now()
-
-  let seed
-  try {
-    seed = buildTranscriptSeed({
-      concept,
-      turns: payload.turns,
-      model: route,
-      nextId: () => randomUUID(),
-    })
-  } catch (error) {
-    return jsonResponse(400, { error: `无法整理这段对话：${describeError(error)}` })
-  }
-
-  try {
-    await agents.create({
-      sessionId,
-      // The transcript is this session's OWN log, not a prefix inherited from
-      // another session, so the header is not marked as seeded; the inherited
-      // cut stays at zero (a seeded header would additionally require an
-      // inherited-cut marker event at that index).
-      meta: {
-        ...(cwd === undefined ? {} : { cwd }),
-        ...(preset === undefined || preset === '' ? {} : { agentPreset: preset }),
-        // The sidebar orders sessions by last activity, which the host derives
-        // from max(createdAt, lastPromptAt). Stamping "now" is what makes the
-        // saved session sort where a brand-new conversation would.
-        createdAt,
-      },
-      inheritedEventCount: 0,
-      seed,
-      ...(route === undefined ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
-    })
-  } catch (error) {
-    return jsonResponse(500, { error: describeError(error) })
-  }
-
-  // Workspace membership is an explicit list, not a cwd match: a session the
-  // agent factory creates would otherwise land under "ungrouped". Attach it
-  // to the workspace that owns the conversation's directory, then move it to
-  // the first row so a saved explanation is easy to find.
-  if (cwd !== undefined) {
-    try {
-      const registry = ctx.get('workspaceRegistry')
-      const workspace = await registry?.resolveByPath?.(cwd)
-      if (workspace !== undefined) {
-        await workspace.attachSession?.(sessionId)
-        const members = Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []
-        const first = members.find(id => id !== sessionId)
-        if (first !== undefined) await workspace.insertSessionBefore?.(sessionId, first)
-      }
-    } catch (error) {
-      console.warn('[concept-explainer] saved session was not attached to its workspace:', error)
-    }
-  }
-
-  // A readable title is what makes the new session findable in the left list.
-  try {
-    await ctx.get('sessionController')?.rename?.({ sessionId, title: concept })
-  } catch (error) {
-    console.warn('[concept-explainer] saved session created without a title:', error)
-  }
-
-  return jsonResponse(200, { saved: true, sessionId })
-}
-
-/**
  * Resolve one live session, resuming its agent when it went cold.
  * @param ctx - host context.
  * @param sessionId - the saved session.
@@ -470,29 +373,16 @@ async function liveSessionOf(ctx, sessionId) {
 }
 
 /**
- * Append one later follow-up exchange to an already saved session, so the
- * panel and the session stay the same conversation.
+ * Append one exchange to an existing session as a completed turn.
  * @param ctx - host context.
- * @param request - the buffered Fetch request.
- * @returns the appended message count, or a JSON error response.
+ * @param sessionId - the session to extend.
+ * @param turns - the user/assistant rows of one exchange.
+ * @returns undefined on success, or the rejection to answer with.
  */
-export async function handleAppend(ctx, request) {
-  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
-  let payload
-  try {
-    payload = JSON.parse(await request.text())
-  } catch {
-    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
-  }
-  const invalid = validateAppendPayload(payload)
-  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
-
-  const session = await liveSessionOf(ctx, payload.sessionId)
-  if (session === undefined) {
-    return jsonResponse(409, { error: '这个会话当前不在运行，暂时无法同步' })
-  }
-
-  const route = resolveRoute(ctx, payload.sessionId)
+async function appendTurns(ctx, sessionId, turns) {
+  const session = await liveSessionOf(ctx, sessionId)
+  if (session === undefined) return { status: 409, message: '这个会话当前不在运行' }
+  const route = resolveRoute(ctx, sessionId)
   const source = {
     kind: 'model',
     provider: typeof route?.provider === 'string' ? route.provider : 'unknown',
@@ -504,12 +394,10 @@ export async function handleAppend(ctx, request) {
   } catch {
     turn = 1
   }
-
-  let appended = 0
   try {
     session.append('turn/start', { turn })
     session.append('step/start', { turn, step: 1 })
-    for (const row of payload.turns) {
+    for (const row of turns) {
       if (row.role === 'user') {
         session.append('user/message', {
           role: 'user',
@@ -530,14 +418,119 @@ export async function handleAppend(ctx, request) {
           stream: [],
         }, { surfaceOp: 'append' })
       }
-      appended += 1
     }
     session.append('step/end', { turn, step: 1 })
     session.append('turn/end', { turn, reason: { kind: 'completed' } })
   } catch (error) {
-    return jsonResponse(500, { error: `同步到会话失败：${describeError(error)}` })
+    return { status: 500, message: describeError(error) }
   }
-  return jsonResponse(200, { appended })
+  return undefined
+}
+
+/**
+ * Turn one finished panel conversation into a real Session: the conversation
+ * is forked natively (so its own injected context comes along), and the
+ * panel's explanation is appended as the branch's next exchange.
+ * @param ctx - host context.
+ * @param request - the buffered Fetch request.
+ * @returns the new session id, or a JSON error response.
+ */
+export async function handleSessionSave(ctx, request) {
+  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
+  let payload
+  try {
+    payload = JSON.parse(await request.text())
+  } catch {
+    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
+  }
+  const invalid = validateSavePayload(payload)
+  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
+
+  const controller = ctx.get('sessionController')
+  if (controller === undefined || typeof controller.fork !== 'function') {
+    return jsonResponse(503, { error: '当前部署不能创建会话分支' })
+  }
+
+  const source = ctx.get('sessions')?.get(payload.sessionId)
+  const cwd = typeof source?.header?.cwd === 'string' && source.header.cwd !== '' ? source.header.cwd : undefined
+  const concept = payload.concept.trim()
+
+  // The fork reads durable history, so flush the live source first: the
+  // branch must contain the conversation exactly as the user sees it.
+  try {
+    if (source !== undefined) await ctx.get('sessions')?.flush?.(source)
+  } catch {
+    // A session that is already durable needs no flush.
+  }
+
+  let sessionId
+  try {
+    const value = await controller.fork({ sessionId: payload.sessionId })
+    sessionId = typeof value?.sessionId === 'string' ? value.sessionId : ''
+  } catch (error) {
+    return jsonResponse(500, { error: `创建分支失败：${describeError(error)}` })
+  }
+  if (sessionId === '') return jsonResponse(500, { error: '创建分支失败：没有返回会话' })
+
+  // The explanation becomes the branch's next exchange.
+  const appendFailure = await appendTurns(ctx, sessionId, payload.turns)
+
+  // Workspace membership is an explicit list, not a cwd match: attach the
+  // branch to the workspace that owns the conversation's directory.
+  if (cwd !== undefined) {
+    try {
+      const registry = ctx.get('workspaceRegistry')
+      const workspace = await registry?.resolveByPath?.(cwd)
+      if (workspace !== undefined) {
+        await workspace.attachSession?.(sessionId)
+        const members = Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []
+        const first = members.find(id => id !== sessionId)
+        if (first !== undefined) await workspace.insertSessionBefore?.(sessionId, first)
+      }
+    } catch (error) {
+      console.warn('[concept-explainer] saved session was not attached to its workspace:', error)
+    }
+  }
+
+  // A readable title is what makes the new session findable in the left list.
+  try {
+    await controller.rename?.({
+      sessionId,
+      title: concept.length > 40 ? `${concept.slice(0, 40)}…` : concept,
+    })
+  } catch (error) {
+    console.warn('[concept-explainer] saved session created without a title:', error)
+  }
+
+  return jsonResponse(200, {
+    saved: true,
+    sessionId,
+    forked: true,
+    ...(appendFailure === undefined ? {} : { warning: `分支已创建，但写入解释失败：${appendFailure.message}` }),
+  })
+}
+
+/**
+ * Append one later follow-up exchange to an already saved session, so the
+ * panel and the session stay the same conversation.
+ * @param ctx - host context.
+ * @param request - the buffered Fetch request.
+ * @returns the appended message count, or a JSON error response.
+ */
+export async function handleAppend(ctx, request) {
+  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
+  let payload
+  try {
+    payload = JSON.parse(await request.text())
+  } catch {
+    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
+  }
+  const invalid = validateAppendPayload(payload)
+  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
+
+  const failure = await appendTurns(ctx, payload.sessionId, payload.turns)
+  if (failure !== undefined) return jsonResponse(failure.status, { error: failure.message })
+  return jsonResponse(200, { appended: payload.turns.length })
 }
 
 /**

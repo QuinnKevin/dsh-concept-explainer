@@ -19,13 +19,14 @@ Select an unfamiliar term in a DeepSeek Harness conversation and get an explanat
 
 ## Save as a session
 
-When an explanation is worth continuing, **Save as session** creates a new session in the left sidebar:
+When an explanation is worth continuing, **Save as session**:
 
-- Its transcript is the explanation: the concept question, the answer, and every follow-up with its answer
-- The new session opens immediately, like a native branch, ready for the next question
-- The title is the concept you selected, so it is easy to find
+- forks the current conversation natively, so the branch carries the full history plus everything DSH injects into the context (AGENTS.md instructions, runtime context, system reminders)
+- appends the panel's explanation (answer, follow-ups and their answers) as the branch's next exchange
+- opens the branch immediately, ready for the next question
+- titles it with the concept you selected, truncated when long
 - The difference from **Save**: a note is a Markdown file; a session is a real conversation you can continue
-- A refused creation shows its reason in the panel and leaves no half-made session behind
+- Once saved, the button reads **Saved as session** and cannot save again; the link details live in its tooltip
 
 ## Saving a note
 
@@ -54,7 +55,7 @@ A good explanation should not disappear when the tab closes. **Save** writes one
 | Explanation | `index.js` | `ctx.connection.fetch.register` + `ctx.llm.stream` (the conversation's model, falling back to the default model) |
 | Context | `prompt.js` | `ctx.sessions.get(id).deriveMessages()`, read-only |
 | Saved note | `index.js` | writes `<session cwd>/concept-notes/*.md` with Node's `fs`; the destination is fixed by the host, never chosen by the request |
-| Saved session | `index.js` | `ctx.agents.create` hands the transcript to DSH's agent factory as the new session's seed; `sessionController.rename` titles it and the client's `uiWorkspace.openSession` opens it |
+| Saved session | `index.js` | `sessionController.fork` copies the conversation (injected context included), then appends the panel's explanation as one turn; the client's `uiWorkspace.openSession` opens it |
 | Custom prompt | `client.js` + `index.js` | the browser's `localStorage` holds the user's replacement system prompt and sends it with each request; an empty value falls back to the built-in rules |
 
 `index.js` and `prompt.js` import no Harness package: plain ESM plus the platform's own `Request` / `Response` / `ReadableStream`.

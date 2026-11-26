@@ -715,7 +715,11 @@ window.__ModuleLoader__.load({
             throw new Error(typeof result?.error === 'string' ? result.error : `HTTP ${response.status}`)
           }
           const createdId = typeof result?.sessionId === 'string' ? result.sessionId : ''
-          setSessionState({ kind: 'created', text: concept })
+          setSessionState({
+            kind: 'created',
+            text: concept,
+            ...(typeof result?.warning === 'string' && result.warning !== '' ? { warning: result.warning } : {}),
+          })
           if (createdId !== '') linkSession(createdId)
           if (createdId !== '' && typeof openSession === 'function') openSession(createdId)
         } catch (failure) {
@@ -766,6 +770,9 @@ window.__ModuleLoader__.load({
           : null,
         linked === '' && sessionState.kind === 'created'
           ? h('div', { className: 'dce-save-line' }, t('sessionSaved', { title: shorten(sessionState.text) }))
+          : null,
+        sessionState.warning
+          ? h('div', { className: 'dce-save-error' }, sessionState.warning)
           : null,
         sessionState.kind === 'error'
           ? h('div', { className: 'dce-save-error' }, t('sessionFailed', { message: sessionState.text }))

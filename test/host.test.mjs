@@ -12,7 +12,6 @@ import { join } from 'node:path'
 import { handleAppend, handleRequest, handleSave, handleSessionSave, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH, SESSION_ROUTE_PATH, APPEND_ROUTE_PATH } from '../index.js'
 import {
   buildRequestMessages,
-  buildTranscriptSeed,
   collectSnippets,
   composeSystemPrompt,
   noteFileName,
@@ -130,23 +129,27 @@ function fakeAppendContext({ live = true, lastTurn = 3, messages = [user('问'),
   return { ctx, appends }
 }
 
-/** A fake host context for session creation: records what the agent factory receives. */
-function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail, attachFail } = {}) {
+/** A fake host context for session creation: records the native fork and the appended turn. */
+function fakeSessionContext({ cwd = 'C:\\ws', fail, attachFail } = {}) {
   const calls = []
-  const session = { header: { cwd, agentPreset: preset }, deriveMessages: () => [] }
+  const source = { header: { cwd }, append: () => {}, deriveMessages: () => [] }
+  const child = {
+    header: { cwd },
+    append(type, data, options) {
+      calls.push({ kind: 'append', type, data, options })
+      return { type, seq: calls.length }
+    },
+    deriveMessages: () => [],
+  }
   const ctx = {
     get(name) {
-      if (name === 'sessions') return { get: () => session }
-      if (name === 'agents') {
+      if (name === 'sessions') {
         return {
-          get: () => undefined,
-          create: async (options) => {
-            calls.push({ kind: 'create', options })
-            if (fail !== undefined) throw fail
-            return { agent: { id: options.sessionId }, dispose: async () => {} }
-          },
+          get: (id) => (id === 'session-source' ? source : child),
+          flush: async () => true,
         }
       }
+      if (name === 'agents') return { turnBoundaryOf: () => ({ lastTurn: 7 }) }
       if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
       if (name === 'workspaceRegistry') {
         return {
@@ -169,10 +172,16 @@ function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail, attachFail }
       }
       if (name === 'sessionController') {
         return {
+          fork: async (request) => {
+            calls.push({ kind: 'fork', request })
+            if (fail !== undefined) throw fail
+            return { sessionId: 'session-child' }
+          },
           rename: async (request) => {
             calls.push({ kind: 'rename', request })
             return { title: request.title, seq: 1 }
           },
+          resolveAgent: async () => ({ agent: { id: 'session-child' } }),
         }
       }
       return undefined
@@ -517,54 +526,8 @@ test('the append endpoint refuses a session that cannot be resumed', async () =>
   assert.equal(response.status, 409)
 })
 
-test('buildTranscriptSeed emits one complete turn per exchange', () => {
-  const seed = buildTranscriptSeed({
-    concept: 'MoE 路由',
-    turns: [
-      { role: 'assistant', text: '第一段解释' },
-      { role: 'user', text: '那稠密模型呢？' },
-      { role: 'assistant', text: '第二段回答' },
-    ],
-    model: { provider: 'deepseek-official', model: 'deepseek-flash' },
-    createdAt: 1000,
-    nextId: () => 'm-1',
-  })
-  assert.deepEqual(seed.map(event => event.type), [
-    'turn/start',
-    'step/start',
-    'user/message',
-    'assistant/message',
-    'step/end',
-    'turn/end',
-    'turn/start',
-    'step/start',
-    'user/message',
-    'assistant/message',
-    'step/end',
-    'turn/end',
-  ])
-  assert.deepEqual(seed.map(event => event.seq), seed.map((_, index) => index))
-  assert.equal(seed[2].surfaceOp, 'append')
-  assert.equal(seed[3].surfaceOp, 'append')
-  assert.equal(seed[3].data.message.source.provider, 'deepseek-official')
-  assert.deepEqual(seed[5].data.reason, { kind: 'completed' })
-  assert.equal(seed[7].data.turn, 2)
-  // The panel transcript starts with the answer, so a question is prepended.
-  assert.match(seed[2].data.content[0].text, /MoE 路由/u)
-})
 
-test('buildTranscriptSeed keeps an existing leading question', () => {
-  const seed = buildTranscriptSeed({
-    concept: 'RAG',
-    turns: [{ role: 'user', text: '什么是 RAG？' }, { role: 'assistant', text: '检索增强生成。' }],
-    createdAt: 0,
-    nextId: () => 'm-1',
-  })
-  assert.equal(seed.length, 6)
-  assert.equal(seed[2].data.content[0].text, '什么是 RAG？')
-})
-
-test('the session endpoint seeds a titled session through the agent factory', async () => {
+test('the session endpoint forks the conversation and appends the explanation', async () => {
   const { ctx, calls } = fakeSessionContext()
   const response = await handleSessionSave(ctx, sessionRequest({
     sessionId: 'session-source',
@@ -577,59 +540,72 @@ test('the session endpoint seeds a titled session through the agent factory', as
   }))
   assert.equal(response.status, 200)
   const body = await response.json()
-  assert.match(body.sessionId, /^session-/u)
+  assert.equal(body.sessionId, 'session-child')
+  assert.equal(body.forked, true)
+  assert.equal(body.warning, undefined)
 
-  const created = calls.find(call => call.kind === 'create')
-  assert.equal(created.options.sessionId, body.sessionId)
-  assert.equal(created.options.meta.cwd, 'C:\\ws')
-  assert.equal(created.options.meta.agentPreset, 'ptc')
-  // Not a fork: the transcript is this session's own log, so the header must
-  // not claim an inherited prefix.
-  assert.equal(created.options.meta.isSeeded, undefined)
-  assert.equal(typeof created.options.meta.createdAt, 'number')
-  assert.ok(created.options.meta.createdAt > 0)
-  assert.equal(created.options.inheritedEventCount, 0)
-  assert.ok(Array.isArray(created.options.seed))
-  assert.equal(created.options.seed.length, 12)
-  assert.equal(created.options.agentOptions.provider, 'deepseek-official')
+  const fork = calls.find(call => call.kind === 'fork')
+  assert.deepEqual(fork.request, { sessionId: 'session-source' })
+
+  const appended = calls.filter(call => call.kind === 'append')
+  assert.deepEqual(appended.map(call => call.type), [
+    'turn/start',
+    'step/start',
+    'assistant/message',
+    'user/message',
+    'assistant/message',
+    'step/end',
+    'turn/end',
+  ])
+  assert.equal(appended[0].data.turn, 8)
+  assert.equal(appended[2].data.message.content[0].text, '解释正文')
+  assert.equal(appended[4].data.message.content[0].text, '追问回答')
 
   const renamed = calls.find(call => call.kind === 'rename')
-  assert.deepEqual(renamed.request, { sessionId: body.sessionId, title: 'MoE 路由' })
+  assert.equal(renamed.request.sessionId, 'session-child')
+  assert.equal(renamed.request.title, 'MoE 路由')
 
-  // The session must join the conversation's workspace, not "ungrouped",
-  // and sit at the first row.
   const resolved = calls.find(call => call.kind === 'resolveWorkspace')
   assert.equal(resolved.path, 'C:\\ws')
   const attached = calls.find(call => call.kind === 'attach')
-  assert.equal(attached.sessionId, body.sessionId)
-  const moved = calls.find(call => call.kind === 'moveToTop')
-  assert.equal(moved.sessionId, body.sessionId)
-  assert.equal(moved.beforeSessionId, 'session-oldest')
+  assert.equal(attached.sessionId, 'session-child')
 })
 
-test('a workspace attach failure still returns the created session', async () => {
-  const { ctx, calls } = fakeSessionContext({ attachFail: new Error('workspace is read-only') })
+test('a long concept becomes a short session title', async () => {
+  const { ctx, calls } = fakeSessionContext()
+  const response = await handleSessionSave(ctx, sessionRequest({
+    sessionId: 'session-source',
+    concept: '这是一段很长的概念说明'.repeat(10),
+    turns: [{ role: 'assistant', text: '正文' }],
+  }))
+  assert.equal(response.status, 200)
+  const renamed = calls.find(call => call.kind === 'rename')
+  assert.equal(renamed.request.title.length, 41)
+  assert.match(renamed.request.title, /…$/u)
+})
+
+test('a workspace attach failure still returns the forked session', async () => {
+  const { ctx } = fakeSessionContext({ attachFail: new Error('workspace is read-only') })
   const response = await handleSessionSave(ctx, sessionRequest({
     sessionId: 'session-source',
     concept: 'RAG',
     turns: [{ role: 'assistant', text: '解释正文' }],
   }))
   assert.equal(response.status, 200)
-  assert.match((await response.json()).sessionId, /^session-/u)
-  assert.equal(calls.some(call => call.kind === 'rename'), true)
+  assert.equal((await response.json()).sessionId, 'session-child')
 })
 
-test('the session endpoint reports a refused creation and a missing factory', async () => {
+test('the session endpoint reports a refused fork and a missing controller', async () => {
   const refused = await handleSessionSave(
-    fakeSessionContext({ fail: new Error('factory rejected the seed') }).ctx,
+    fakeSessionContext({ fail: new Error('source is not readable') }).ctx,
     sessionRequest({ sessionId: 's', concept: 'x', turns: [{ role: 'assistant', text: '正文' }] }),
   )
   assert.equal(refused.status, 500)
-  assert.match((await refused.json()).error, /factory rejected the seed/u)
+  assert.match((await refused.json()).error, /创建分支失败/u)
 
-  const noFactory = await handleSessionSave(
+  const noController = await handleSessionSave(
     { get: name => (name === 'sessions' ? { get: () => ({ header: { cwd: 'C:\\ws' } }) } : undefined) },
     sessionRequest({ sessionId: 's', concept: 'x', turns: [{ role: 'assistant', text: '正文' }] }),
   )
-  assert.equal(noFactory.status, 503)
+  assert.equal(noController.status, 503)
 })
