@@ -397,16 +397,20 @@ export async function handleSessionSave(ctx, request) {
   try {
     await agents.create({
       sessionId,
+      // The transcript is this session's OWN log, not a prefix inherited from
+      // another session, so the header is not marked as seeded; the inherited
+      // cut stays at zero (a seeded header would additionally require an
+      // inherited-cut marker event at that index).
       meta: {
         ...(cwd === undefined ? {} : { cwd }),
-        isSeeded: true,
         ...(preset === undefined || preset === '' ? {} : { agentPreset: preset }),
       },
+      inheritedEventCount: 0,
       seed,
       ...(route === undefined ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
     })
   } catch (error) {
-    return jsonResponse(500, { error: `创建会话失败：${describeError(error)}` })
+    return jsonResponse(500, { error: describeError(error) })
   }
 
   // A readable title is what makes the new session findable in the left list.

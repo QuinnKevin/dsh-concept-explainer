@@ -492,7 +492,10 @@ test('the session endpoint seeds a titled session through the agent factory', as
   assert.equal(created.options.sessionId, body.sessionId)
   assert.equal(created.options.meta.cwd, 'C:\\ws')
   assert.equal(created.options.meta.agentPreset, 'ptc')
-  assert.equal(created.options.meta.isSeeded, true)
+  // Not a fork: the transcript is this session's own log, so the header must
+  // not claim an inherited prefix.
+  assert.equal(created.options.meta.isSeeded, undefined)
+  assert.equal(created.options.inheritedEventCount, 0)
   assert.ok(Array.isArray(created.options.seed))
   assert.equal(created.options.seed.length, 12)
   assert.equal(created.options.agentOptions.provider, 'deepseek-official')
