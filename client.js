@@ -378,11 +378,13 @@ window.__ModuleLoader__.load({
     }
 
     /** Project a session event window into the panel's two-role transcript. */
-    function turnsOfWindow(window) {
+    function turnsOfWindow(window, since) {
       const rows = []
+      const floor = typeof since === 'number' ? since : undefined
       for (const entry of Array.isArray(window?.entries) ? window.entries : []) {
         if (entry?.type !== 'event') continue
         const event = entry.event
+        if (floor !== undefined && typeof event?.seq === 'number' && event.seq < floor) continue
         if (event?.type === 'user/message') {
           const text = textOfMessage(event.data)
           if (text !== '') rows.push({ role: 'user', text })
@@ -417,6 +419,7 @@ window.__ModuleLoader__.load({
       const [sessionState, setSessionState] = React.useState({ kind: 'idle', text: '' })
       const [linked, setLinked] = React.useState('')
       const linkedRef = React.useRef('')
+      const linkedSinceRef = React.useRef(undefined)
       const syncingRef = React.useRef(false)
       const turnsRef = React.useRef([])
       const abortRef = React.useRef(null)
@@ -428,8 +431,9 @@ window.__ModuleLoader__.load({
         setTurns(next)
       }, [])
 
-      const linkSession = React.useCallback((id) => {
+      const linkSession = React.useCallback((id, since) => {
         linkedRef.current = id
+        linkedSinceRef.current = typeof since === 'number' ? since : undefined
         setLinked(id)
       }, [])
 
@@ -617,7 +621,7 @@ window.__ModuleLoader__.load({
         }
         let stop
         try {
-          stop = watcherRef.current?.(linked, onTurns)
+          stop = watcherRef.current?.(linked, linkedSinceRef.current, onTurns)
         } catch {
           stop = undefined
         }
@@ -720,7 +724,7 @@ window.__ModuleLoader__.load({
             text: concept,
             ...(typeof result?.warning === 'string' && result.warning !== '' ? { warning: result.warning } : {}),
           })
-          if (createdId !== '') linkSession(createdId)
+          if (createdId !== '') linkSession(createdId, typeof result?.seq === 'number' ? result.seq : undefined)
           if (createdId !== '' && typeof openSession === 'function') openSession(createdId)
         } catch (failure) {
           setSessionState({
@@ -933,7 +937,7 @@ window.__ModuleLoader__.load({
             // source so anything typed in that conversation reaches the
             // panel as it is committed. Retaining the reference guarantees
             // the source exists even before the conversation is selected.
-            watchSession: (id, onTurns) => {
+            watchSession: (id, since, onTurns) => {
               const sessions = ctx.get('sessions')
               if (sessions === undefined) return () => {}
               let cancelled = false
@@ -945,7 +949,7 @@ window.__ModuleLoader__.load({
                 if (source === undefined || source === null || typeof source.subscribe !== 'function') return
                 const push = () => {
                   try {
-                    onTurns(turnsOfWindow(source.getSnapshot()))
+                    onTurns(turnsOfWindow(source.getSnapshot(), since))
                   } catch {
                     // A mid-teardown window is skipped.
                   }

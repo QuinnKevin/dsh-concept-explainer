@@ -502,7 +502,9 @@ test('the append endpoint adds one completed turn to the saved session', async (
     turns: [{ role: 'user', text: '再问一句' }, { role: 'assistant', text: '再答一句' }],
   }))
   assert.equal(response.status, 200)
-  assert.deepEqual(await response.json(), { appended: 2 })
+  const body = await response.json()
+  assert.equal(body.appended, 2)
+  assert.equal(typeof body.seq, 'number')
   assert.deepEqual(appends.map(row => row.type), [
     'turn/start',
     'step/start',
@@ -551,6 +553,7 @@ test('the session endpoint forks the conversation and appends the explanation', 
   assert.deepEqual(appended.map(call => call.type), [
     'turn/start',
     'step/start',
+    'user/message',
     'assistant/message',
     'user/message',
     'assistant/message',
@@ -558,8 +561,12 @@ test('the session endpoint forks the conversation and appends the explanation', 
     'turn/end',
   ])
   assert.equal(appended[0].data.turn, 8)
-  assert.equal(appended[2].data.message.content[0].text, '解释正文')
-  assert.equal(appended[4].data.message.content[0].text, '追问回答')
+  // The panel transcript starts with the answer, so the appended turn gets a
+  // leading question like every native turn.
+  assert.match(appended[2].data.content[0].text, /请解释「MoE 路由」/u)
+  assert.equal(appended[3].data.message.content[0].text, '解释正文')
+  assert.equal(appended[5].data.message.content[0].text, '追问回答')
+  assert.equal(typeof body.seq, 'number')
 
   const renamed = calls.find(call => call.kind === 'rename')
   assert.equal(renamed.request.sessionId, 'session-child')

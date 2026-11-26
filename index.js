@@ -373,11 +373,28 @@ async function liveSessionOf(ctx, sessionId) {
 }
 
 /**
+ * Prefix the panel transcript with the question that produced the explanation,
+ * so the appended turn starts with a user message like every native turn.
+ * @param turns - the panel's rows, usually starting with the answer.
+ * @param concept - the explained term.
+ * @returns rows beginning with a user message.
+ */
+function withIntro(turns, concept) {
+  const rows = (Array.isArray(turns) ? turns : [])
+    .filter(row => row !== null && typeof row === 'object'
+      && (row.role === 'user' || row.role === 'assistant')
+      && typeof row.text === 'string' && row.text.trim() !== '')
+    .map(row => ({ role: row.role, text: row.text.trim() }))
+  if (rows.length > 0 && rows[0].role === 'user') return rows
+  return [{ role: 'user', text: `请解释「${concept}」。` }, ...rows]
+}
+
+/**
  * Append one exchange to an existing session as a completed turn.
  * @param ctx - host context.
  * @param sessionId - the session to extend.
  * @param turns - the user/assistant rows of one exchange.
- * @returns undefined on success, or the rejection to answer with.
+ * @returns `{ firstSeq }` on success, or the rejection to answer with.
  */
 async function appendTurns(ctx, sessionId, turns) {
   const session = await liveSessionOf(ctx, sessionId)
@@ -394,8 +411,10 @@ async function appendTurns(ctx, sessionId, turns) {
   } catch {
     turn = 1
   }
+  let firstSeq
   try {
-    session.append('turn/start', { turn })
+    const started = session.append('turn/start', { turn })
+    firstSeq = typeof started?.seq === 'number' ? started.seq : undefined
     session.append('step/start', { turn, step: 1 })
     for (const row of turns) {
       if (row.role === 'user') {
@@ -424,7 +443,7 @@ async function appendTurns(ctx, sessionId, turns) {
   } catch (error) {
     return { status: 500, message: describeError(error) }
   }
-  return undefined
+  return { firstSeq }
 }
 
 /**
@@ -473,7 +492,8 @@ export async function handleSessionSave(ctx, request) {
   if (sessionId === '') return jsonResponse(500, { error: '创建分支失败：没有返回会话' })
 
   // The explanation becomes the branch's next exchange.
-  const appendFailure = await appendTurns(ctx, sessionId, payload.turns)
+  const appended = await appendTurns(ctx, sessionId, withIntro(payload.turns, concept))
+  const appendFailure = appended.status !== undefined ? appended : undefined
 
   // Workspace membership is an explicit list, not a cwd match: attach the
   // branch to the workspace that owns the conversation's directory.
@@ -506,6 +526,7 @@ export async function handleSessionSave(ctx, request) {
     saved: true,
     sessionId,
     forked: true,
+    ...(appendFailure === undefined && typeof appended.firstSeq === 'number' ? { seq: appended.firstSeq } : {}),
     ...(appendFailure === undefined ? {} : { warning: `分支已创建，但写入解释失败：${appendFailure.message}` }),
   })
 }
@@ -528,9 +549,12 @@ export async function handleAppend(ctx, request) {
   const invalid = validateAppendPayload(payload)
   if (invalid !== undefined) return jsonResponse(400, { error: invalid })
 
-  const failure = await appendTurns(ctx, payload.sessionId, payload.turns)
-  if (failure !== undefined) return jsonResponse(failure.status, { error: failure.message })
-  return jsonResponse(200, { appended: payload.turns.length })
+  const appended = await appendTurns(ctx, payload.sessionId, withIntro(payload.turns, '这段对话'))
+  if (appended.status !== undefined) return jsonResponse(appended.status, { error: appended.message })
+  return jsonResponse(200, {
+    appended: payload.turns.length,
+    ...(typeof appended.firstSeq === 'number' ? { seq: appended.firstSeq } : {}),
+  })
 }
 
 /**
