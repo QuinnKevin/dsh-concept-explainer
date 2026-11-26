@@ -514,6 +514,8 @@ test('the session endpoint seeds a titled session through the agent factory', as
   // Not a fork: the transcript is this session's own log, so the header must
   // not claim an inherited prefix.
   assert.equal(created.options.meta.isSeeded, undefined)
+  assert.equal(typeof created.options.meta.createdAt, 'number')
+  assert.ok(created.options.meta.createdAt > 0)
   assert.equal(created.options.inheritedEventCount, 0)
   assert.ok(Array.isArray(created.options.seed))
   assert.equal(created.options.seed.length, 12)

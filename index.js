@@ -381,6 +381,7 @@ export async function handleSessionSave(ctx, request) {
   const route = resolveRoute(ctx, payload.sessionId)
   const concept = payload.concept.trim()
   const sessionId = `session-${randomUUID()}`
+  const createdAt = Date.now()
 
   let seed
   try {
@@ -404,6 +405,10 @@ export async function handleSessionSave(ctx, request) {
       meta: {
         ...(cwd === undefined ? {} : { cwd }),
         ...(preset === undefined || preset === '' ? {} : { agentPreset: preset }),
+        // The sidebar orders sessions by last activity, which the host derives
+        // from max(createdAt, lastPromptAt). Stamping "now" is what makes the
+        // saved session sort where a brand-new conversation would.
+        createdAt,
       },
       inheritedEventCount: 0,
       seed,
