@@ -413,6 +413,19 @@ export async function handleSessionSave(ctx, request) {
     return jsonResponse(500, { error: describeError(error) })
   }
 
+  // Workspace membership is an explicit list, not a cwd match: a session the
+  // agent factory creates would otherwise land under "ungrouped". Attach it
+  // to the workspace that owns the conversation's directory.
+  if (cwd !== undefined) {
+    try {
+      const registry = ctx.get('workspaceRegistry')
+      const workspace = await registry?.resolveByPath?.(cwd)
+      await workspace?.attachSession?.(sessionId)
+    } catch (error) {
+      console.warn('[concept-explainer] saved session was not attached to its workspace:', error)
+    }
+  }
+
   // A readable title is what makes the new session findable in the left list.
   try {
     await ctx.get('sessionController')?.rename?.({ sessionId, title: concept })

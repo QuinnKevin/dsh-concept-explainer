@@ -99,7 +99,7 @@ function sessionRequest(body) {
 }
 
 /** A fake host context for session creation: records what the agent factory receives. */
-function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail } = {}) {
+function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail, attachFail } = {}) {
   const calls = []
   const session = { header: { cwd, agentPreset: preset }, deriveMessages: () => [] }
   const ctx = {
@@ -116,6 +116,19 @@ function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail } = {}) {
         }
       }
       if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+      if (name === 'workspaceRegistry') {
+        return {
+          resolveByPath: async (path) => {
+            calls.push({ kind: 'resolveWorkspace', path })
+            if (attachFail !== undefined) throw attachFail
+            return {
+              attachSession: async (sessionId) => {
+                calls.push({ kind: 'attach', sessionId })
+              },
+            }
+          },
+        }
+      }
       if (name === 'sessionController') {
         return {
           rename: async (request) => {
@@ -502,6 +515,24 @@ test('the session endpoint seeds a titled session through the agent factory', as
 
   const renamed = calls.find(call => call.kind === 'rename')
   assert.deepEqual(renamed.request, { sessionId: body.sessionId, title: 'MoE 路由' })
+
+  // The session must join the conversation's workspace, not "ungrouped".
+  const resolved = calls.find(call => call.kind === 'resolveWorkspace')
+  assert.equal(resolved.path, 'C:\\ws')
+  const attached = calls.find(call => call.kind === 'attach')
+  assert.equal(attached.sessionId, body.sessionId)
+})
+
+test('a workspace attach failure still returns the created session', async () => {
+  const { ctx, calls } = fakeSessionContext({ attachFail: new Error('workspace is read-only') })
+  const response = await handleSessionSave(ctx, sessionRequest({
+    sessionId: 'session-source',
+    concept: 'RAG',
+    turns: [{ role: 'assistant', text: '解释正文' }],
+  }))
+  assert.equal(response.status, 200)
+  assert.match((await response.json()).sessionId, /^session-/u)
+  assert.equal(calls.some(call => call.kind === 'rename'), true)
 })
 
 test('the session endpoint reports a refused creation and a missing factory', async () => {
