@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Concept explainer",
-    "description": "Explain an unfamiliar term selected in the conversation in a separate right-sidebar tab, leaving the conversation untouched."
+    "description": "Explain an unfamiliar term in a separate right-sidebar tab, save it as a note, or branch the conversation with it; the conversation stays untouched."
   }
 }

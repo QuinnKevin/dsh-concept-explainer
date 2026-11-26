@@ -1,9 +1,11 @@
 {
   "name": "@local/dsh-concept-explainer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Explain a selected concept from the conversation in an isolated right-sidebar tab, without touching the main conversation.",
+  "description": "Explain a selected concept in an isolated right-sidebar tab, save it as a Markdown note, or branch the conversation with the explanation appended.",
+  "license": "MIT",
+  "author": "QuinnYe",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -16,7 +18,8 @@
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "icon.svg"
+    "icon.svg",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },

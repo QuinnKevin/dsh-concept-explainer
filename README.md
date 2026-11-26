@@ -28,6 +28,8 @@ When an explanation is worth continuing, **Save as session**:
 - The difference from **Save**: a note is a Markdown file; a session is a real conversation you can continue
 - Once saved, the button reads **Saved as session** and cannot save again; the link details live in its tooltip
 
+Once saved, the panel and the branch stay one conversation: a follow-up asked in the panel is appended to the session immediately, and anything typed in that session appears in the panel through its event stream. The panel shows the explanation exchange onward — not the whole forked history.
+
 ## Saving a note
 
 A good explanation should not disappear when the tab closes. **Save** writes one Markdown file into the workspace of the conversation the panel belongs to:
@@ -82,3 +84,7 @@ node test/client.test.mjs
 - Explanations render as plain text with line breaks preserved; Markdown code blocks are not rendered.
 - A saved note goes to the conversation's workspace only; there is no workspace picker in this version.
 - No web search or dictionary lookup: the answer comes from the model and the conversation. Unknown concepts are reported as such rather than invented.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
