@@ -286,3 +286,110 @@ export function validateSavePayload(payload) {
   }
   return undefined
 }
+
+/**
+ * Build the seed events for a saved explanation conversation.
+ *
+ * The shapes mirror a persisted text-only exchange: `turn/start` →
+ * `step/start` → `user/message` → `assistant/message` → `step/end` →
+ * `turn/end`, with `surfaceOp: 'append'` on the two message events and
+ * contiguous `seq` values. The host hands this straight to the agent factory,
+ * so no session log is edited by hand.
+ *
+ * @param options - concept, transcript turns, assistant model source, time and id generator.
+ * @returns the session's seed events, oldest first.
+ */
+export function buildTranscriptSeed({ concept, turns, model, createdAt, nextId }) {
+  const now = typeof createdAt === 'number' ? createdAt : Date.now()
+  const makeId = typeof nextId === 'function' ? nextId : () => `m-${Math.random().toString(36).slice(2, 10)}`
+  const source = {
+    kind: 'model',
+    provider: typeof model?.provider === 'string' && model.provider !== '' ? model.provider : 'unknown',
+    model: typeof model?.model === 'string' && model.model !== '' ? model.model : 'unknown',
+  }
+
+  const rows = (Array.isArray(turns) ? turns : [])
+    .filter(row => row !== null && typeof row === 'object'
+      && (row.role === 'user' || row.role === 'assistant')
+      && typeof row.text === 'string' && row.text.trim() !== '')
+    .map(row => ({ role: row.role, text: row.text.trim() }))
+
+  const script = rows.length > 0 && rows[0].role === 'user'
+    ? rows.slice()
+    : [{ role: 'user', text: `请解释「${concept}」。` }, ...rows]
+
+  const events = []
+  let seq = 0
+  let time = now
+  const push = (type, data, surface) => {
+    time += 1
+    events.push({ type, seq: seq++, time, data, ...(surface === true ? { surfaceOp: 'append' } : {}) })
+  }
+
+  let turn = 0
+  let index = 0
+  while (index < script.length) {
+    const row = script[index]
+    if (row.role === 'assistant') {
+      // An answer with no question before it joins the previous turn when one
+      // exists; otherwise it opens its own turn with a neutral question.
+      if (turn === 0) {
+        turn = 1
+        push('turn/start', { turn })
+        push('step/start', { turn, step: 1 })
+        push('user/message', {
+          role: 'user',
+          content: [{ type: 'text', text: `请解释「${concept}」。` }],
+          source: { kind: 'user' },
+          id: makeId(),
+        }, true)
+      }
+      push('assistant/message', {
+        turn,
+        step: 1,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: row.text }],
+          source,
+          id: makeId(),
+        },
+        stream: [],
+      }, true)
+      index += 1
+      continue
+    }
+
+    if (turn > 0 && events[events.length - 1]?.type !== 'turn/end') {
+      push('step/end', { turn, step: 1 })
+      push('turn/end', { turn, reason: { kind: 'completed' } })
+    }
+    turn += 1
+    push('turn/start', { turn })
+    push('step/start', { turn, step: 1 })
+    push('user/message', {
+      role: 'user',
+      content: [{ type: 'text', text: row.text }],
+      source: { kind: 'user' },
+      id: makeId(),
+    }, true)
+    index += 1
+    while (index < script.length && script[index].role === 'assistant') {
+      push('assistant/message', {
+        turn,
+        step: 1,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: script[index].text }],
+          source,
+          id: makeId(),
+        },
+        stream: [],
+      }, true)
+      index += 1
+    }
+    push('step/end', { turn, step: 1 })
+    push('turn/end', { turn, reason: { kind: 'completed' } })
+  }
+
+  return events
+}

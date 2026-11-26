@@ -14,7 +14,18 @@ Select an unfamiliar term in a DeepSeek Harness conversation and get an explanat
 4. Keep asking follow-ups at the bottom: Enter sends, Shift+Enter adds a line.
 5. **Customize prompt** at the top of the tab edits the system prompt sent to the model. Saved changes apply to later answers; **Restore default** brings back the built-in rules.
 6. **Save** at the top writes the whole panel conversation — explanation, follow-ups and the referenced fragments — as a Markdown note in the workspace. The panel then shows the file name.
-7. The tab is also listed in the sidebar's `+` menu; its empty state explains how to start.
+7. **Save as session** turns the same conversation into a new session in the left list and opens it, so you can keep talking there.
+8. The tab is also listed in the sidebar's `+` menu; its empty state explains how to start.
+
+## Save as a session
+
+When an explanation is worth continuing, **Save as session** creates a new session in the left sidebar:
+
+- Its transcript is the explanation: the concept question, the answer, and every follow-up with its answer
+- The new session opens immediately, like a native branch, ready for the next question
+- The title is the concept you selected, so it is easy to find
+- The difference from **Save**: a note is a Markdown file; a session is a real conversation you can continue
+- A refused creation shows its reason in the panel and leaves no half-made session behind
 
 ## Saving a note
 
@@ -43,6 +54,7 @@ A good explanation should not disappear when the tab closes. **Save** writes one
 | Explanation | `index.js` | `ctx.connection.fetch.register` + `ctx.llm.stream` (the conversation's model, falling back to the default model) |
 | Context | `prompt.js` | `ctx.sessions.get(id).deriveMessages()`, read-only |
 | Saved note | `index.js` | writes `<session cwd>/concept-notes/*.md` with Node's `fs`; the destination is fixed by the host, never chosen by the request |
+| Saved session | `index.js` | `ctx.agents.create` hands the transcript to DSH's agent factory as the new session's seed; `sessionController.rename` titles it and the client's `uiWorkspace.openSession` opens it |
 | Custom prompt | `client.js` + `index.js` | the browser's `localStorage` holds the user's replacement system prompt and sends it with each request; an empty value falls back to the built-in rules |
 
 `index.js` and `prompt.js` import no Harness package: plain ESM plus the platform's own `Request` / `Response` / `ReadableStream`.

@@ -23,6 +23,8 @@ window.__ModuleLoader__.load({
     const ENDPOINT = 'api/concept-explainer/stream'
     /** Host endpoint that writes the panel's transcript into the workspace. */
     const SAVE_ENDPOINT = 'api/concept-explainer/save'
+    /** Host endpoint that turns the panel's transcript into a real session. */
+    const SESSION_ENDPOINT = 'api/concept-explainer/session'
 
     const zh = {
       explain: '解释此概念',
@@ -42,7 +44,7 @@ window.__ModuleLoader__.load({
       failed: '生成失败，请重试',
       stopped: '已停止',
       noText: '（模型没有输出内容）',
-      settingsOpen: '自定义要求',
+      settingsOpen: '提示词',
       settingsClose: '收起',
       settingsTitle: '解释要求（系统提示词）',
       settingsHint: '这段文字会作为系统提示词发给模型；留空或点「恢复默认」使用内置规则。修改只影响之后的回答。',
@@ -54,6 +56,11 @@ window.__ModuleLoader__.load({
       savedTo: '已保存到 {path}',
       saveFailed: '保存失败：{message}',
       saveEmpty: '还没有可以保存的解释',
+      saveSession: '存为会话',
+      saveSessionHint: '把这段解释变成左侧的新会话，可以继续聊',
+      sessionSaving: '创建中…',
+      sessionSaved: '已创建会话「{title}」',
+      sessionFailed: '创建会话失败：{message}',
     }
 
     const en = {
@@ -74,7 +81,7 @@ window.__ModuleLoader__.load({
       failed: 'Generation failed, please retry',
       stopped: 'Stopped',
       noText: '(the model returned no text)',
-      settingsOpen: 'Customize prompt',
+      settingsOpen: 'Prompt',
       settingsClose: 'Close',
       settingsTitle: 'Explanation prompt (system)',
       settingsHint: 'This text is sent as the system prompt. Leave it empty or restore the default to use the built-in rules. Changes apply to later answers.',
@@ -86,6 +93,11 @@ window.__ModuleLoader__.load({
       savedTo: 'Saved to {path}',
       saveFailed: 'Save failed: {message}',
       saveEmpty: 'Nothing to save yet',
+      saveSession: 'Save as session',
+      saveSessionHint: 'Turn this explanation into a new session in the sidebar and continue there',
+      sessionSaving: 'Creating…',
+      sessionSaved: 'Created session “{title}”',
+      sessionFailed: 'Could not create the session: {message}',
     }
 
     const CSS = [
@@ -100,6 +112,7 @@ window.__ModuleLoader__.load({
       '.dce-link:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}',
       '.dce-link[disabled]{opacity:.45;cursor:default}',
       '.dce-save-line{font-size:11px;line-height:1.5;color:var(--dsw-alias-state-success-primary);word-break:break-all}',
+      '.dce-save-path{margin-top:2px;font-size:10.5px;line-height:1.45;color:var(--dsw-alias-label-secondary);word-break:break-all;user-select:text}',
       '.dce-save-error{font-size:11px;line-height:1.5;color:var(--dsw-alias-state-error-primary);word-break:break-all}',
       '.dce-editor{display:flex;flex-direction:column;gap:8px;padding:12px 16px;border-bottom:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);flex:none}',
       '.dce-editor-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary)}',
@@ -348,7 +361,7 @@ window.__ModuleLoader__.load({
     }
 
     /** The right-sidebar panel: concept header, transcript, follow-up input. */
-    function ExplainPanel({ sessionId, useTabInfo, t }) {
+    function ExplainPanel({ sessionId, useTabInfo, t, openSession }) {
       const params = readParams(useTabInfo)
       const concept = typeof params.concept === 'string' ? params.concept : ''
       const nonce = typeof params.nonce === 'string' ? params.nonce : ''
@@ -361,6 +374,7 @@ window.__ModuleLoader__.load({
       const [editorOpen, setEditorOpen] = React.useState(false)
       const [draftSystem, setDraftSystem] = React.useState('')
       const [saveState, setSaveState] = React.useState({ kind: 'idle', text: '' })
+      const [sessionState, setSessionState] = React.useState({ kind: 'idle', text: '' })
       const turnsRef = React.useRef([])
       const abortRef = React.useRef(null)
       const startedRef = React.useRef('')
@@ -388,6 +402,7 @@ window.__ModuleLoader__.load({
         setError('')
         // New content makes an earlier saved copy stale; hide its path.
         setSaveState({ kind: 'idle', text: '' })
+        setSessionState({ kind: 'idle', text: '' })
 
         let text = ''
         try {
@@ -477,6 +492,7 @@ window.__ModuleLoader__.load({
           setStatus('idle')
           setError('')
           setSaveState({ kind: 'idle', text: '' })
+          setSessionState({ kind: 'idle', text: '' })
           return
         }
         const key = `${nonce}\u0000${concept}`
@@ -487,6 +503,7 @@ window.__ModuleLoader__.load({
         setError('')
         setDraft('')
         setSaveState({ kind: 'idle', text: '' })
+        setSessionState({ kind: 'idle', text: '' })
         void stream(concept, '')
       }, [concept, nonce, commit, stream])
 
@@ -556,9 +573,44 @@ window.__ModuleLoader__.load({
           if (!response.ok) {
             throw new Error(typeof result?.error === 'string' ? result.error : `HTTP ${response.status}`)
           }
-          setSaveState({ kind: 'saved', text: String(result?.relative ?? '') })
+          setSaveState({ kind: 'saved', text: String(result?.relative ?? ''), path: String(result?.path ?? '') })
         } catch (failure) {
           setSaveState({ kind: 'error', text: typeof failure?.message === 'string' ? failure.message : t('saveFailed', { message: '' }) })
+        }
+      }
+
+      const saveAsSession = async () => {
+        const rows = turnsRef.current
+          .map(row => ({ role: row.role, text: row.text }))
+          .filter(row => row.text.trim() !== '')
+        if (rows.length === 0) {
+          setSessionState({ kind: 'error', text: t('saveEmpty') })
+          return
+        }
+        setSessionState({ kind: 'creating', text: '' })
+        try {
+          const response = await fetch(new URL(SESSION_ENDPOINT, document.baseURI).href, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, concept, turns: rows }),
+          })
+          let result = {}
+          try {
+            result = await response.json()
+          } catch {
+            result = {}
+          }
+          if (!response.ok) {
+            throw new Error(typeof result?.error === 'string' ? result.error : `HTTP ${response.status}`)
+          }
+          const createdId = typeof result?.sessionId === 'string' ? result.sessionId : ''
+          setSessionState({ kind: 'created', text: concept })
+          if (createdId !== '' && typeof openSession === 'function') openSession(createdId)
+        } catch (failure) {
+          setSessionState({
+            kind: 'error',
+            text: typeof failure?.message === 'string' ? failure.message : t('sessionFailed', { message: '' }),
+          })
         }
       }
 
@@ -575,15 +627,32 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'dce-link',
+            title: t('saveSessionHint'),
+            disabled: !canSave || sessionState.kind === 'creating',
+            onClick: () => { void saveAsSession() },
+          }, sessionState.kind === 'creating' ? t('sessionSaving') : t('saveSession')),
+          h('button', {
+            type: 'button',
+            className: 'dce-link',
             onClick: () => (editorOpen ? setEditorOpen(false) : openEditor()),
           }, editorOpen ? t('settingsClose') : t('settingsOpen'))),
         concept === '' ? null : h('p', { className: 'dce-concept' }, concept),
         h('div', { className: 'dce-note' }, t('readOnly')),
         saveState.kind === 'saved'
-          ? h('div', { className: 'dce-save-line' }, t('savedTo', { path: saveState.text }))
+          ? h('div', { className: 'dce-save-line' },
+            t('savedTo', { path: saveState.text }),
+            typeof saveState.path === 'string' && saveState.path !== ''
+              ? h('div', { className: 'dce-save-path' }, saveState.path)
+              : null)
           : null,
         saveState.kind === 'error'
           ? h('div', { className: 'dce-save-error' }, t('saveFailed', { message: saveState.text }))
+          : null,
+        sessionState.kind === 'created'
+          ? h('div', { className: 'dce-save-line' }, t('sessionSaved', { title: sessionState.text }))
+          : null,
+        sessionState.kind === 'error'
+          ? h('div', { className: 'dce-save-error' }, t('sessionFailed', { message: sessionState.text }))
           : null)
 
       const editor = editorOpen ? h(PromptEditor, {
@@ -729,6 +798,15 @@ window.__ModuleLoader__.load({
           name: 'sidebar.right.pane.tab',
           key: KIND,
           locale: NS,
+          inject: () => ({
+            openSession: (id) => {
+              try {
+                ctx.get('uiWorkspace')?.openSession?.(id)
+              } catch (error) {
+                console.warn('[concept-explainer] could not open the saved session:', error)
+              }
+            },
+          }),
         }, ExplainPanel))
 
         ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({

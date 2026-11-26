@@ -295,6 +295,7 @@ test('the panel renders the empty state before a concept is chosen', () => {
   assert.match(rendered, /emptyHint/u)
   assert.match(rendered, /readOnly/u)
   assert.match(rendered, /saveNote/u)
+  assert.match(rendered, /saveSession/u)
 })
 
 test('the panel renders a concept header and composer from tab navigation params', () => {

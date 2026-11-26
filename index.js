@@ -8,10 +8,12 @@
  * workspace. Nothing here appends an event to the session, so the main
  * conversation cannot change.
  */
+import { randomUUID } from 'node:crypto'
 import { mkdir, realpath, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import {
   buildRequestMessages,
+  buildTranscriptSeed,
   collectSnippets,
   composeSystemPrompt,
   noteFileName,
@@ -26,6 +28,9 @@ export const ROUTE_PATH = '/api/concept-explainer/stream'
 
 /** The route that saves one finished conversation as a workspace note. */
 export const SAVE_ROUTE_PATH = '/api/concept-explainer/save'
+
+/** The route that turns one finished conversation into a real Session. */
+export const SESSION_ROUTE_PATH = '/api/concept-explainer/session'
 
 /** Largest request body accepted (the panel's own transcript is small). */
 const MAX_BODY_BYTES = 256 * 1024
@@ -347,6 +352,74 @@ export async function handleSave(ctx, request) {
 }
 
 /**
+ * Turn one finished panel conversation into a real Session: the panel's
+ * transcript becomes the new session's seed, so it opens as an ordinary
+ * conversation in the left list and can be continued there.
+ * @param ctx - host context.
+ * @param request - the buffered Fetch request.
+ * @returns the new session id, or a JSON error response.
+ */
+export async function handleSessionSave(ctx, request) {
+  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
+  let payload
+  try {
+    payload = JSON.parse(await request.text())
+  } catch {
+    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
+  }
+  const invalid = validateSavePayload(payload)
+  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
+
+  const agents = ctx.get('agents')
+  if (agents === undefined || typeof agents.create !== 'function') {
+    return jsonResponse(503, { error: '当前部署不能创建会话' })
+  }
+
+  const source = ctx.get('sessions')?.get(payload.sessionId)
+  const cwd = typeof source?.header?.cwd === 'string' && source.header.cwd !== '' ? source.header.cwd : undefined
+  const preset = typeof source?.header?.agentPreset === 'string' ? source.header.agentPreset : undefined
+  const route = resolveRoute(ctx, payload.sessionId)
+  const concept = payload.concept.trim()
+  const sessionId = `session-${randomUUID()}`
+
+  let seed
+  try {
+    seed = buildTranscriptSeed({
+      concept,
+      turns: payload.turns,
+      model: route,
+      nextId: () => randomUUID(),
+    })
+  } catch (error) {
+    return jsonResponse(400, { error: `无法整理这段对话：${describeError(error)}` })
+  }
+
+  try {
+    await agents.create({
+      sessionId,
+      meta: {
+        ...(cwd === undefined ? {} : { cwd }),
+        isSeeded: true,
+        ...(preset === undefined || preset === '' ? {} : { agentPreset: preset }),
+      },
+      seed,
+      ...(route === undefined ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
+    })
+  } catch (error) {
+    return jsonResponse(500, { error: `创建会话失败：${describeError(error)}` })
+  }
+
+  // A readable title is what makes the new session findable in the left list.
+  try {
+    await ctx.get('sessionController')?.rename?.({ sessionId, title: concept })
+  } catch (error) {
+    console.warn('[concept-explainer] saved session created without a title:', error)
+  }
+
+  return jsonResponse(200, { saved: true, sessionId })
+}
+
+/**
  * Host plugin body: own the panel's `/api` routes for its lifetime.
  * @param ctx - host context.
  */
@@ -359,6 +432,7 @@ export function apply(ctx) {
   const routes = [
     { path: ROUTE_PATH, fetch: request => handleRequest(ctx, request) },
     { path: SAVE_ROUTE_PATH, fetch: request => handleSave(ctx, request) },
+    { path: SESSION_ROUTE_PATH, fetch: request => handleSessionSave(ctx, request) },
   ]
   for (const route of routes) {
     const registered = connection.fetch.register({

@@ -9,9 +9,10 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { handleRequest, handleSave, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH } from '../index.js'
+import { handleRequest, handleSave, handleSessionSave, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH, SESSION_ROUTE_PATH } from '../index.js'
 import {
   buildRequestMessages,
+  buildTranscriptSeed,
   collectSnippets,
   composeSystemPrompt,
   noteFileName,
@@ -86,6 +87,47 @@ function saveRequest(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+/** Build a real Request for the session endpoint. */
+function sessionRequest(body) {
+  return new Request(`http://127.0.0.1:7362${SESSION_ROUTE_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+/** A fake host context for session creation: records what the agent factory receives. */
+function fakeSessionContext({ cwd = 'C:\\ws', preset = 'ptc', fail } = {}) {
+  const calls = []
+  const session = { header: { cwd, agentPreset: preset }, deriveMessages: () => [] }
+  const ctx = {
+    get(name) {
+      if (name === 'sessions') return { get: () => session }
+      if (name === 'agents') {
+        return {
+          get: () => undefined,
+          create: async (options) => {
+            calls.push({ kind: 'create', options })
+            if (fail !== undefined) throw fail
+            return { agent: { id: options.sessionId }, dispose: async () => {} }
+          },
+        }
+      }
+      if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+      if (name === 'sessionController') {
+        return {
+          rename: async (request) => {
+            calls.push({ kind: 'rename', request })
+            return { title: request.title, seq: 1 }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  return { ctx, calls }
 }
 
 /** A fake host context for save: one session whose cwd is the temp workspace. */
@@ -382,4 +424,94 @@ test('a session without a workspace directory is refused', async () => {
   }))
   assert.equal(response.status, 409)
   assert.match((await response.json()).error, /工作区/u)
+})
+
+test('buildTranscriptSeed emits one complete turn per exchange', () => {
+  const seed = buildTranscriptSeed({
+    concept: 'MoE 路由',
+    turns: [
+      { role: 'assistant', text: '第一段解释' },
+      { role: 'user', text: '那稠密模型呢？' },
+      { role: 'assistant', text: '第二段回答' },
+    ],
+    model: { provider: 'deepseek-official', model: 'deepseek-flash' },
+    createdAt: 1000,
+    nextId: () => 'm-1',
+  })
+  assert.deepEqual(seed.map(event => event.type), [
+    'turn/start',
+    'step/start',
+    'user/message',
+    'assistant/message',
+    'step/end',
+    'turn/end',
+    'turn/start',
+    'step/start',
+    'user/message',
+    'assistant/message',
+    'step/end',
+    'turn/end',
+  ])
+  assert.deepEqual(seed.map(event => event.seq), seed.map((_, index) => index))
+  assert.equal(seed[2].surfaceOp, 'append')
+  assert.equal(seed[3].surfaceOp, 'append')
+  assert.equal(seed[3].data.message.source.provider, 'deepseek-official')
+  assert.deepEqual(seed[5].data.reason, { kind: 'completed' })
+  assert.equal(seed[7].data.turn, 2)
+  // The panel transcript starts with the answer, so a question is prepended.
+  assert.match(seed[2].data.content[0].text, /MoE 路由/u)
+})
+
+test('buildTranscriptSeed keeps an existing leading question', () => {
+  const seed = buildTranscriptSeed({
+    concept: 'RAG',
+    turns: [{ role: 'user', text: '什么是 RAG？' }, { role: 'assistant', text: '检索增强生成。' }],
+    createdAt: 0,
+    nextId: () => 'm-1',
+  })
+  assert.equal(seed.length, 6)
+  assert.equal(seed[2].data.content[0].text, '什么是 RAG？')
+})
+
+test('the session endpoint seeds a titled session through the agent factory', async () => {
+  const { ctx, calls } = fakeSessionContext()
+  const response = await handleSessionSave(ctx, sessionRequest({
+    sessionId: 'session-source',
+    concept: 'MoE 路由',
+    turns: [
+      { role: 'assistant', text: '解释正文' },
+      { role: 'user', text: '追问一句' },
+      { role: 'assistant', text: '追问回答' },
+    ],
+  }))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.match(body.sessionId, /^session-/u)
+
+  const created = calls.find(call => call.kind === 'create')
+  assert.equal(created.options.sessionId, body.sessionId)
+  assert.equal(created.options.meta.cwd, 'C:\\ws')
+  assert.equal(created.options.meta.agentPreset, 'ptc')
+  assert.equal(created.options.meta.isSeeded, true)
+  assert.ok(Array.isArray(created.options.seed))
+  assert.equal(created.options.seed.length, 12)
+  assert.equal(created.options.agentOptions.provider, 'deepseek-official')
+
+  const renamed = calls.find(call => call.kind === 'rename')
+  assert.deepEqual(renamed.request, { sessionId: body.sessionId, title: 'MoE 路由' })
+})
+
+test('the session endpoint reports a refused creation and a missing factory', async () => {
+  const refused = await handleSessionSave(
+    fakeSessionContext({ fail: new Error('factory rejected the seed') }).ctx,
+    sessionRequest({ sessionId: 's', concept: 'x', turns: [{ role: 'assistant', text: '正文' }] }),
+  )
+  assert.equal(refused.status, 500)
+  assert.match((await refused.json()).error, /factory rejected the seed/u)
+
+  const noFactory = await handleSessionSave(
+    { get: name => (name === 'sessions' ? { get: () => ({ header: { cwd: 'C:\\ws' } }) } : undefined) },
+    sessionRequest({ sessionId: 's', concept: 'x', turns: [{ role: 'assistant', text: '正文' }] }),
+  )
+  assert.equal(noFactory.status, 503)
 })
