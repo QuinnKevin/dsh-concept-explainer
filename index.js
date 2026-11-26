@@ -19,7 +19,6 @@ import {
   noteFileName,
   NOTE_FOLDER,
   renderNoteMarkdown,
-  turnsFromMessages,
   validateAppendPayload,
   validatePayload,
   validateSavePayload,
@@ -36,9 +35,6 @@ export const SESSION_ROUTE_PATH = '/api/concept-explainer/session'
 
 /** The route that appends a later follow-up to an already saved session. */
 export const APPEND_ROUTE_PATH = '/api/concept-explainer/append'
-
-/** The route that reads a saved session's transcript back into the panel. */
-export const TRANSCRIPT_ROUTE_PATH = '/api/concept-explainer/transcript'
 
 /** Largest request body accepted (the panel's own transcript is small). */
 const MAX_BODY_BYTES = 256 * 1024
@@ -545,34 +541,6 @@ export async function handleAppend(ctx, request) {
 }
 
 /**
- * Read a saved session's transcript, so the panel reflects activity that
- * happened in the conversation itself.
- * @param ctx - host context.
- * @param request - the buffered Fetch request.
- * @returns the two-role transcript, or a JSON error response.
- */
-export async function handleTranscript(ctx, request) {
-  let payload
-  try {
-    payload = JSON.parse(await request.text())
-  } catch {
-    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
-  }
-  if (payload === null || typeof payload !== 'object' || typeof payload.sessionId !== 'string') {
-    return jsonResponse(400, { error: '缺少会话标识' })
-  }
-  const session = ctx.get('sessions')?.get(payload.sessionId)
-  if (session === undefined) return jsonResponse(200, { live: false, turns: [] })
-  let turns = []
-  try {
-    turns = turnsFromMessages(session.deriveMessages())
-  } catch (error) {
-    return jsonResponse(500, { error: `读取会话失败：${describeError(error)}` })
-  }
-  return jsonResponse(200, { live: true, turns })
-}
-
-/**
  * Host plugin body: own the panel's `/api` routes for its lifetime.
  * @param ctx - host context.
  */
@@ -587,7 +555,6 @@ export function apply(ctx) {
     { path: SAVE_ROUTE_PATH, fetch: request => handleSave(ctx, request) },
     { path: SESSION_ROUTE_PATH, fetch: request => handleSessionSave(ctx, request) },
     { path: APPEND_ROUTE_PATH, fetch: request => handleAppend(ctx, request) },
-    { path: TRANSCRIPT_ROUTE_PATH, fetch: request => handleTranscript(ctx, request) },
   ]
   for (const route of routes) {
     const registered = connection.fetch.register({

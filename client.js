@@ -27,8 +27,6 @@ window.__ModuleLoader__.load({
     const SESSION_ENDPOINT = 'api/concept-explainer/session'
     /** Host endpoint that appends a later follow-up to the saved session. */
     const APPEND_ENDPOINT = 'api/concept-explainer/append'
-    /** Host endpoint that reads the saved session's transcript back. */
-    const TRANSCRIPT_ENDPOINT = 'api/concept-explainer/transcript'
 
     const zh = {
       explain: '解释此概念',
@@ -66,6 +64,7 @@ window.__ModuleLoader__.load({
       sessionSaved: '已创建会话「{title}」',
       sessionFailed: '创建会话失败：{message}',
       linkedTo: '已连接会话「{title}」，两边的追问会同步',
+      savedAlready: '已存为会话',
     }
 
     const en = {
@@ -104,6 +103,7 @@ window.__ModuleLoader__.load({
       sessionSaved: 'Created session “{title}”',
       sessionFailed: 'Could not create the session: {message}',
       linkedTo: 'Linked to “{title}”; follow-ups in either place stay in sync',
+      savedAlready: 'Saved as session',
     }
 
     const CSS = [
@@ -127,7 +127,7 @@ window.__ModuleLoader__.load({
       '.dce-editor-hint{font-size:11px;line-height:1.55;color:var(--dsw-alias-label-secondary)}',
       '.dce-concept{margin:0;font-size:14px;line-height:1.5;font-weight:600;word-break:break-word;max-height:96px;overflow:auto}',
       '.dce-note{font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary)}',
-      '.dce-body{display:flex;flex-direction:column;gap:14px;padding:14px 16px 20px;flex:1 1 auto;min-height:0}',
+      '.dce-body{display:flex;flex-direction:column;gap:14px;padding:14px 16px 20px;flex:1 1 auto;min-height:0;overflow-y:auto}',
       '.dce-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;min-height:220px;text-align:center;color:var(--dsw-alias-label-secondary)}',
       '.dce-empty-title{margin:0;font-size:13px;color:var(--dsw-alias-label-primary)}',
       '.dce-empty-hint{margin:0;font-size:12px;line-height:1.6;max-width:280px}',
@@ -366,8 +366,42 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Join the text blocks of one message-like object. */
+    function textOfMessage(message) {
+      const content = message?.content
+      if (!Array.isArray(content)) return ''
+      let text = ''
+      for (const block of content) {
+        if (block?.type === 'text' && typeof block.text === 'string') text += block.text
+      }
+      return text.trim()
+    }
+
+    /** Project a session event window into the panel's two-role transcript. */
+    function turnsOfWindow(window) {
+      const rows = []
+      for (const entry of Array.isArray(window?.entries) ? window.entries : []) {
+        if (entry?.type !== 'event') continue
+        const event = entry.event
+        if (event?.type === 'user/message') {
+          const text = textOfMessage(event.data)
+          if (text !== '') rows.push({ role: 'user', text })
+        } else if (event?.type === 'assistant/message') {
+          const text = textOfMessage(event.data?.message)
+          if (text !== '') rows.push({ role: 'assistant', text })
+        }
+      }
+      return rows
+    }
+
+    /** Shorten one label for a tooltip. */
+    function shorten(text, max = 18) {
+      const value = typeof text === 'string' ? text.trim() : ''
+      return value.length > max ? `${value.slice(0, max)}…` : value
+    }
+
     /** The right-sidebar panel: concept header, transcript, follow-up input. */
-    function ExplainPanel({ sessionId, useTabInfo, t, openSession }) {
+    function ExplainPanel({ sessionId, useTabInfo, t, openSession, watchSession }) {
       const params = readParams(useTabInfo)
       const concept = typeof params.concept === 'string' ? params.concept : ''
       const nonce = typeof params.nonce === 'string' ? params.nonce : ''
@@ -558,42 +592,43 @@ window.__ModuleLoader__.load({
       }, [turns, status])
 
       // While linked, the saved session is the source of truth for content
-      // added elsewhere (the user typing in that conversation). Polling keeps
-      // both places showing the same exchange without a second chat engine.
+      // added elsewhere (the user typing in that conversation). The session's
+      // own event source pushes changes, so nothing polls.
+      const statusRef = React.useRef(status)
+      statusRef.current = status
+      const watcherRef = React.useRef(watchSession)
+      watcherRef.current = watchSession
+
       React.useEffect(() => {
-        if (linked === '' || status === 'streaming') return
-        let cancelled = false
+        if (linked === '') return undefined
         const intro = concept === '' ? '' : `请解释「${concept}」。`
-        const pull = async () => {
-          if (cancelled || syncingRef.current) return
+        const onTurns = (rows) => {
+          if (statusRef.current === 'streaming' || syncingRef.current) return
+          let next = Array.isArray(rows)
+            ? rows.filter(row => typeof row?.text === 'string' && row.text.trim() !== '')
+            : []
+          // The saved session opens with the synthetic concept question; the
+          // panel keeps the concept in its header instead.
+          if (next.length > 0 && next[0].role === 'user' && next[0].text.trim() === intro) next = next.slice(1)
+          if (next.length === 0) return
+          const current = turnsRef.current.map(row => `${row.role}\u0000${row.text}`).join('\n')
+          const updated = next.map(row => `${row.role}\u0000${row.text}`).join('\n')
+          if (current !== updated) commit(next.map(row => ({ role: row.role, text: row.text })))
+        }
+        let stop
+        try {
+          stop = watcherRef.current?.(linked, onTurns)
+        } catch {
+          stop = undefined
+        }
+        return () => {
           try {
-            const response = await fetch(new URL(TRANSCRIPT_ENDPOINT, document.baseURI).href, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ sessionId: linked }),
-            })
-            if (!response.ok) return
-            const result = await response.json()
-            if (cancelled || result?.live !== true || !Array.isArray(result.turns)) return
-            let rows = result.turns.filter(row => typeof row?.text === 'string' && row.text.trim() !== '')
-            // The saved session opens with the synthetic concept question;
-            // the panel keeps the concept in its header instead.
-            if (rows.length > 0 && rows[0].role === 'user' && rows[0].text.trim() === intro) rows = rows.slice(1)
-            if (rows.length === 0) return
-            const current = turnsRef.current.map(row => `${row.role}\u0000${row.text}`).join('\n')
-            const next = rows.map(row => `${row.role}\u0000${row.text}`).join('\n')
-            if (current !== next) commit(rows.map(row => ({ role: row.role, text: row.text })))
+            if (typeof stop === 'function') stop()
           } catch {
-            // A missed poll leaves the panel as it is.
+            // A torn-down binding is already gone.
           }
         }
-        void pull()
-        const timer = setInterval(() => { void pull() }, 4000)
-        return () => {
-          cancelled = true
-          clearInterval(timer)
-        }
-      }, [linked, status, commit, concept])
+      }, [linked, commit, concept])
 
       const streaming = status === 'streaming'
       const submit = () => {
@@ -704,10 +739,14 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'dce-link',
-            title: t('saveSessionHint'),
-            disabled: !canSave || sessionState.kind === 'creating',
+            title: linked === ''
+              ? t('saveSessionHint')
+              : t('linkedTo', { title: shorten(sessionState.text !== '' ? sessionState.text : concept) }),
+            disabled: linked !== '' || !canSave || sessionState.kind === 'creating',
             onClick: () => { void saveAsSession() },
-          }, sessionState.kind === 'creating' ? t('sessionSaving') : t('saveSession')),
+          }, linked !== ''
+            ? t('savedAlready')
+            : sessionState.kind === 'creating' ? t('sessionSaving') : t('saveSession')),
           h('button', {
             type: 'button',
             className: 'dce-link',
@@ -725,11 +764,9 @@ window.__ModuleLoader__.load({
         saveState.kind === 'error'
           ? h('div', { className: 'dce-save-error' }, t('saveFailed', { message: saveState.text }))
           : null,
-        linked !== ''
-          ? h('div', { className: 'dce-save-line' }, t('linkedTo', { title: sessionState.text !== '' ? sessionState.text : concept }))
-          : sessionState.kind === 'created'
-            ? h('div', { className: 'dce-save-line' }, t('sessionSaved', { title: sessionState.text }))
-            : null,
+        linked === '' && sessionState.kind === 'created'
+          ? h('div', { className: 'dce-save-line' }, t('sessionSaved', { title: shorten(sessionState.text) }))
+          : null,
         sessionState.kind === 'error'
           ? h('div', { className: 'dce-save-error' }, t('sessionFailed', { message: sessionState.text }))
           : null)
@@ -883,6 +920,60 @@ window.__ModuleLoader__.load({
                 ctx.get('uiWorkspace')?.openSession?.(id)
               } catch (error) {
                 console.warn('[concept-explainer] could not open the saved session:', error)
+              }
+            },
+            // Push, not poll: subscribe to the saved session's own event
+            // source so anything typed in that conversation reaches the
+            // panel as it is committed. Retaining the reference guarantees
+            // the source exists even before the conversation is selected.
+            watchSession: (id, onTurns) => {
+              const sessions = ctx.get('sessions')
+              if (sessions === undefined) return () => {}
+              let cancelled = false
+              let unsubscribe
+              let reference
+              const start = (binding) => {
+                if (cancelled) return
+                const source = binding?.eventSource
+                if (source === undefined || source === null || typeof source.subscribe !== 'function') return
+                const push = () => {
+                  try {
+                    onTurns(turnsOfWindow(source.getSnapshot()))
+                  } catch {
+                    // A mid-teardown window is skipped.
+                  }
+                }
+                push()
+                unsubscribe = source.subscribe(push)
+              }
+              try {
+                reference = sessions.retain?.(id, { source: 'controllerOperation' })
+              } catch {
+                reference = undefined
+              }
+              if (reference !== undefined && reference !== null) {
+                try {
+                  if (reference.binding !== undefined && reference.binding !== null) start(reference.binding)
+                  else if (typeof reference.ready?.then === 'function') {
+                    void reference.ready.then((binding) => { start(binding) }).catch(() => {})
+                  }
+                } catch {
+                  // A refused reference falls through to release below.
+                }
+                return () => {
+                  cancelled = true
+                  try { if (typeof unsubscribe === 'function') unsubscribe() } catch {}
+                  try { reference.release?.() } catch {}
+                }
+              }
+              try {
+                start(sessions.binding?.(id))
+              } catch {
+                // No live binding: the panel keeps what it already shows.
+              }
+              return () => {
+                cancelled = true
+                try { if (typeof unsubscribe === 'function') unsubscribe() } catch {}
               }
             },
           }),

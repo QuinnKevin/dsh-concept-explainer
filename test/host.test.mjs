@@ -9,7 +9,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { handleAppend, handleRequest, handleSave, handleSessionSave, handleTranscript, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH, SESSION_ROUTE_PATH, APPEND_ROUTE_PATH, TRANSCRIPT_ROUTE_PATH } from '../index.js'
+import { handleAppend, handleRequest, handleSave, handleSessionSave, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH, SESSION_ROUTE_PATH, APPEND_ROUTE_PATH } from '../index.js'
 import {
   buildRequestMessages,
   buildTranscriptSeed,
@@ -17,7 +17,6 @@ import {
   composeSystemPrompt,
   noteFileName,
   renderNoteMarkdown,
-  turnsFromMessages,
   validateAppendPayload,
   validatePayload,
   validateSavePayload,
@@ -103,15 +102,6 @@ function sessionRequest(body) {
 /** Build a real Request for the append endpoint. */
 function appendRequest(body) {
   return new Request(`http://127.0.0.1:7362${APPEND_ROUTE_PATH}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-}
-
-/** Build a real Request for the transcript endpoint. */
-function transcriptRequest(body) {
-  return new Request(`http://127.0.0.1:7362${TRANSCRIPT_ROUTE_PATH}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -487,16 +477,6 @@ test('a session without a workspace directory is refused', async () => {
   assert.match((await response.json()).error, /工作区/u)
 })
 
-test('turnsFromMessages keeps only user and assistant text', () => {
-  const turns = turnsFromMessages([
-    user('问题'),
-    { role: 'tool', content: [{ type: 'text', text: '工具输出' }] },
-    { role: 'assistant', content: [{ type: 'reasoning', text: '想' }, { type: 'text', text: '回答' }] },
-    { role: 'assistant', content: [{ type: 'tool-call', id: 'c', name: 'x', arguments: '{}' }] },
-  ])
-  assert.deepEqual(turns, [{ role: 'user', text: '问题' }, { role: 'assistant', text: '回答' }])
-})
-
 test('validateAppendPayload requires a matched pair', () => {
   assert.match(validateAppendPayload({ sessionId: 's', turns: [] }), /缺少/u)
   assert.match(validateAppendPayload({ sessionId: 's', turns: [{ role: 'user', text: 'q' }] }), /一问一答/u)
@@ -535,16 +515,6 @@ test('the append endpoint refuses a session that cannot be resumed', async () =>
     turns: [{ role: 'user', text: 'q' }, { role: 'assistant', text: 'a' }],
   }))
   assert.equal(response.status, 409)
-})
-
-test('the transcript endpoint projects the saved session', async () => {
-  const { ctx } = fakeAppendContext()
-  const response = await handleTranscript(ctx, transcriptRequest({ sessionId: 'session-saved' }))
-  assert.equal(response.status, 200)
-  assert.deepEqual(await response.json(), {
-    live: true,
-    turns: [{ role: 'user', text: '问' }, { role: 'assistant', text: '答' }],
-  })
 })
 
 test('buildTranscriptSeed emits one complete turn per exchange', () => {

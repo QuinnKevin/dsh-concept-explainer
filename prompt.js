@@ -46,22 +46,6 @@ function normalize(text) {
 }
 
 /**
- * Project derived session messages into the panel's two-role transcript.
- * @param messages - `session.deriveMessages()`.
- * @returns user/assistant text rows, oldest first.
- */
-export function turnsFromMessages(messages) {
-  const rows = []
-  for (const message of Array.isArray(messages) ? messages : []) {
-    if (message?.role !== 'user' && message?.role !== 'assistant') continue
-    const text = messageText(message)
-    if (text === '') continue
-    rows.push({ role: message.role, text })
-  }
-  return rows
-}
-
-/**
  * Validate one append payload: follow-up turns to add to a saved session.
  * @param payload - parsed JSON body from the browser.
  * @returns a human-readable rejection, or undefined when acceptable.
