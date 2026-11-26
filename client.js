@@ -21,6 +21,8 @@ window.__ModuleLoader__.load({
     const NS = 'conceptExplainer'
     /** Host endpoint, resolved against the page base. */
     const ENDPOINT = 'api/concept-explainer/stream'
+    /** Host endpoint that writes the panel's transcript into the workspace. */
+    const SAVE_ENDPOINT = 'api/concept-explainer/save'
 
     const zh = {
       explain: '解释此概念',
@@ -47,6 +49,11 @@ window.__ModuleLoader__.load({
       restore: '恢复默认',
       cancel: '取消',
       save: '保存',
+      saveNote: '保存',
+      saving: '保存中…',
+      savedTo: '已保存到 {path}',
+      saveFailed: '保存失败：{message}',
+      saveEmpty: '还没有可以保存的解释',
     }
 
     const en = {
@@ -74,6 +81,11 @@ window.__ModuleLoader__.load({
       restore: 'Restore default',
       cancel: 'Cancel',
       save: 'Save',
+      saveNote: 'Save',
+      saving: 'Saving…',
+      savedTo: 'Saved to {path}',
+      saveFailed: 'Save failed: {message}',
+      saveEmpty: 'Nothing to save yet',
     }
 
     const CSS = [
@@ -86,6 +98,9 @@ window.__ModuleLoader__.load({
       '.dce-head-title{flex:1 1 auto;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}',
       '.dce-link{flex:none;height:22px;padding:0 8px;border:none;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;cursor:pointer}',
       '.dce-link:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}',
+      '.dce-link[disabled]{opacity:.45;cursor:default}',
+      '.dce-save-line{font-size:11px;line-height:1.5;color:var(--dsw-alias-state-success-primary);word-break:break-all}',
+      '.dce-save-error{font-size:11px;line-height:1.5;color:var(--dsw-alias-state-error-primary);word-break:break-all}',
       '.dce-editor{display:flex;flex-direction:column;gap:8px;padding:12px 16px;border-bottom:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);flex:none}',
       '.dce-editor-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary)}',
       '.dce-editor-input{box-sizing:border-box;width:100%;resize:vertical;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:1.6}',
@@ -345,6 +360,7 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = React.useState('')
       const [editorOpen, setEditorOpen] = React.useState(false)
       const [draftSystem, setDraftSystem] = React.useState('')
+      const [saveState, setSaveState] = React.useState({ kind: 'idle', text: '' })
       const turnsRef = React.useRef([])
       const abortRef = React.useRef(null)
       const startedRef = React.useRef('')
@@ -370,6 +386,8 @@ window.__ModuleLoader__.load({
         commit(next)
         setStatus('streaming')
         setError('')
+        // New content makes an earlier saved copy stale; hide its path.
+        setSaveState({ kind: 'idle', text: '' })
 
         let text = ''
         try {
@@ -458,6 +476,7 @@ window.__ModuleLoader__.load({
           setSnippets([])
           setStatus('idle')
           setError('')
+          setSaveState({ kind: 'idle', text: '' })
           return
         }
         const key = `${nonce}\u0000${concept}`
@@ -467,6 +486,7 @@ window.__ModuleLoader__.load({
         setSnippets([])
         setError('')
         setDraft('')
+        setSaveState({ kind: 'idle', text: '' })
         void stream(concept, '')
       }, [concept, nonce, commit, stream])
 
@@ -509,6 +529,39 @@ window.__ModuleLoader__.load({
         setDraftSystem(DEFAULT_SYSTEM)
       }
 
+      const canSave = status !== 'streaming'
+        && turns.some(row => row.role === 'assistant' && row.text.trim() !== '')
+
+      const saveNote = async () => {
+        const rows = turnsRef.current
+          .map(row => ({ role: row.role, text: row.text }))
+          .filter(row => row.text.trim() !== '')
+        if (rows.length === 0) {
+          setSaveState({ kind: 'error', text: t('saveEmpty') })
+          return
+        }
+        setSaveState({ kind: 'saving', text: '' })
+        try {
+          const response = await fetch(new URL(SAVE_ENDPOINT, document.baseURI).href, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, concept, turns: rows, snippets }),
+          })
+          let result = {}
+          try {
+            result = await response.json()
+          } catch {
+            result = {}
+          }
+          if (!response.ok) {
+            throw new Error(typeof result?.error === 'string' ? result.error : `HTTP ${response.status}`)
+          }
+          setSaveState({ kind: 'saved', text: String(result?.relative ?? '') })
+        } catch (failure) {
+          setSaveState({ kind: 'error', text: typeof failure?.message === 'string' ? failure.message : t('saveFailed', { message: '' }) })
+        }
+      }
+
       const header = h('div', { className: 'dce-head' },
         h('div', { className: 'dce-head-row' },
           h(Glyph, { size: 14 }),
@@ -516,10 +569,22 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'dce-link',
+            disabled: !canSave || saveState.kind === 'saving',
+            onClick: () => { void saveNote() },
+          }, saveState.kind === 'saving' ? t('saving') : t('saveNote')),
+          h('button', {
+            type: 'button',
+            className: 'dce-link',
             onClick: () => (editorOpen ? setEditorOpen(false) : openEditor()),
           }, editorOpen ? t('settingsClose') : t('settingsOpen'))),
         concept === '' ? null : h('p', { className: 'dce-concept' }, concept),
-        h('div', { className: 'dce-note' }, t('readOnly')))
+        h('div', { className: 'dce-note' }, t('readOnly')),
+        saveState.kind === 'saved'
+          ? h('div', { className: 'dce-save-line' }, t('savedTo', { path: saveState.text }))
+          : null,
+        saveState.kind === 'error'
+          ? h('div', { className: 'dce-save-error' }, t('saveFailed', { message: saveState.text }))
+          : null)
 
       const editor = editorOpen ? h(PromptEditor, {
         t,

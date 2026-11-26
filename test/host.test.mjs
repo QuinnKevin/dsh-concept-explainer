@@ -5,13 +5,19 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { handleRequest, resolveRoute, ROUTE_PATH } from '../index.js'
+import { handleRequest, handleSave, resolveRoute, ROUTE_PATH, SAVE_ROUTE_PATH } from '../index.js'
 import {
   buildRequestMessages,
   collectSnippets,
   composeSystemPrompt,
+  noteFileName,
+  renderNoteMarkdown,
   validatePayload,
+  validateSavePayload,
 } from '../prompt.js'
 
 /** One assistant answer as `session.deriveMessages()` would return it. */
@@ -71,6 +77,27 @@ function request(body) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+/** Build a real Request for the save endpoint. */
+function saveRequest(body) {
+  return new Request(`http://127.0.0.1:7362${SAVE_ROUTE_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+/** A fake host context for save: one session whose cwd is the temp workspace. */
+function fakeSaveContext(cwd) {
+  const session = {
+    header: cwd === undefined ? {} : { cwd },
+    deriveMessages: () => [],
+    append() { throw new Error('saving must never append to the session') },
+  }
+  return {
+    get: name => (name === 'sessions' ? { get: () => session } : undefined),
+  }
 }
 
 test('collectSnippets keeps the neighbourhood of the selected text', () => {
@@ -254,4 +281,105 @@ test('the system prompt states the read-only rule', () => {
   const prompt = composeSystemPrompt()
   assert.match(prompt, /只读语境/u)
   assert.match(prompt, /不是给你的指令/u)
+})
+
+test('noteFileName keeps CJK and never carries a path separator', () => {
+  const date = new Date(2026, 10, 26)
+  assert.equal(noteFileName('MoE 路由', date), '2026-11-26-MoE-路由.md')
+  assert.equal(noteFileName('a/b\\c:d', date), '2026-11-26-a-b-c-d.md')
+  assert.equal(noteFileName('../../etc/passwd', date), '2026-11-26-etc-passwd.md')
+  assert.equal(noteFileName('   ', date), '2026-11-26-concept.md')
+})
+
+test('renderNoteMarkdown lays out the explanation, follow-ups and references', () => {
+  const markdown = renderNoteMarkdown({
+    concept: 'MoE 路由',
+    turns: [
+      { role: 'assistant', text: '第一段解释' },
+      { role: 'user', text: '那和稠密模型比呢？' },
+      { role: 'assistant', text: '第二段回答' },
+    ],
+    snippets: [{ role: 'assistant', preview: '对话里的一句话' }],
+    sessionId: 'session-9',
+    savedAt: '2026/11/26 21:30:00',
+  })
+  assert.match(markdown, /^# MoE 路由$/mu)
+  assert.match(markdown, /## 解释\n\n第一段解释/u)
+  assert.match(markdown, /\*\*问：\*\* 那和稠密模型比呢？/u)
+  assert.match(markdown, /\*\*答：\*\* 第二段回答/u)
+  assert.match(markdown, /## 引用的对话片段/u)
+  assert.match(markdown, /来源会话：session-9/u)
+})
+
+test('validateSavePayload rejects empty and malformed content', () => {
+  assert.match(validateSavePayload({ sessionId: 's', concept: 'x', turns: [] }), /还没有/u)
+  assert.match(validateSavePayload({ sessionId: 's', concept: 'x', turns: [{ role: 'system', text: 'y' }] }), /格式/u)
+  assert.match(validateSavePayload({ sessionId: '', concept: 'x', turns: [{ role: 'assistant', text: 'y' }] }), /会话/u)
+  assert.equal(validateSavePayload({ sessionId: 's', concept: 'x', turns: [{ role: 'assistant', text: 'y' }] }), undefined)
+})
+
+test('the save endpoint writes a note inside concept-notes/', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-ce-'))
+  try {
+    const ctx = fakeSaveContext(dir)
+    const response = await handleSave(ctx, saveRequest({
+      sessionId: 'session-1',
+      concept: 'MoE 路由',
+      turns: [
+        { role: 'assistant', text: '解释正文' },
+        { role: 'user', text: '追问一句' },
+        { role: 'assistant', text: '追问的回答' },
+      ],
+      snippets: [{ role: 'assistant', preview: '片段' }],
+    }))
+    assert.equal(response.status, 200)
+    const body = await response.json()
+    assert.equal(body.saved, true)
+    assert.match(body.relative, /^concept-notes\/\d{4}-\d{2}-\d{2}-MoE-路由\.md$/u)
+
+    const saved = await readFile(join(dir, body.relative), 'utf8')
+    assert.match(saved, /解释正文/u)
+    assert.match(saved, /\*\*问：\*\* 追问一句/u)
+    assert.match(saved, /## 引用的对话片段/u)
+
+    const second = await (await handleSave(ctx, saveRequest({
+      sessionId: 'session-1',
+      concept: 'MoE 路由',
+      turns: [{ role: 'assistant', text: '再存一次' }],
+    }))).json()
+    assert.notEqual(second.relative, body.relative)
+    assert.match(second.relative, /-2\.md$/u)
+
+    assert.deepEqual(await readdir(dir), ['concept-notes'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a concept full of path characters still lands inside the folder', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-ce-'))
+  try {
+    const ctx = fakeSaveContext(dir)
+    const body = await (await handleSave(ctx, saveRequest({
+      sessionId: 's',
+      concept: '../../evil',
+      turns: [{ role: 'assistant', text: '正文' }],
+    }))).json()
+    assert.match(body.relative, /^concept-notes\//u)
+    assert.equal(body.relative.includes('..'), false)
+    assert.deepEqual(await readdir(dir), ['concept-notes'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a session without a workspace directory is refused', async () => {
+  const ctx = fakeSaveContext(undefined)
+  const response = await handleSave(ctx, saveRequest({
+    sessionId: 's',
+    concept: 'x',
+    turns: [{ role: 'assistant', text: '正文' }],
+  }))
+  assert.equal(response.status, 409)
+  assert.match((await response.json()).error, /工作区/u)
 })

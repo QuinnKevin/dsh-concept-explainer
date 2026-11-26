@@ -1,20 +1,31 @@
 /**
  * Host half of the Concept Explainer bundle.
  *
- * One authenticated `/api` endpoint: it reads the session's own messages as
+ * Two authenticated `/api` endpoints: one reads the session's own messages as
  * read-only context, asks the harness LLM service for an explanation, and
- * streams the answer back as newline-delimited JSON. Nothing here appends an
- * event to the session, so the main conversation cannot change.
+ * streams the answer back as newline-delimited JSON; the other saves the
+ * panel's finished transcript as a Markdown note inside the session's
+ * workspace. Nothing here appends an event to the session, so the main
+ * conversation cannot change.
  */
+import { mkdir, realpath, writeFile } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 import {
   buildRequestMessages,
   collectSnippets,
   composeSystemPrompt,
+  noteFileName,
+  NOTE_FOLDER,
+  renderNoteMarkdown,
   validatePayload,
+  validateSavePayload,
 } from './prompt.js'
 
 /** The exact Fetch route this bundle owns. */
 export const ROUTE_PATH = '/api/concept-explainer/stream'
+
+/** The route that saves one finished conversation as a workspace note. */
+export const SAVE_ROUTE_PATH = '/api/concept-explainer/save'
 
 /** Largest request body accepted (the panel's own transcript is small). */
 const MAX_BODY_BYTES = 256 * 1024
@@ -257,7 +268,86 @@ export async function handleRequest(ctx, request) {
 }
 
 /**
- * Host plugin body: own one exact `/api` route for the panel's lifetime.
+ * Whether one resolved path stays inside a resolved root.
+ * @param root - the resolved workspace directory.
+ * @param candidate - the resolved candidate path.
+ * @returns true when the candidate is the root itself or lies below it.
+ */
+function insideRoot(root, candidate) {
+  return candidate === root || candidate.startsWith(root + sep)
+}
+
+/**
+ * Save one finished panel conversation as a Markdown file inside the
+ * session's workspace. The destination is fixed (`<workspace>/concept-notes/`)
+ * and the file name is derived from the concept, so the request cannot choose
+ * an arbitrary path.
+ * @param ctx - host context.
+ * @param request - the buffered Fetch request.
+ * @returns the saved relative path, or a JSON error response.
+ */
+export async function handleSave(ctx, request) {
+  if (tooLarge(request)) return jsonResponse(413, { error: '请求内容过大' })
+  let payload
+  try {
+    payload = JSON.parse(await request.text())
+  } catch {
+    return jsonResponse(400, { error: '请求内容不是合法 JSON' })
+  }
+  const invalid = validateSavePayload(payload)
+  if (invalid !== undefined) return jsonResponse(400, { error: invalid })
+
+  const session = ctx.get('sessions')?.get(payload.sessionId)
+  const cwd = typeof session?.header?.cwd === 'string' && session.header.cwd !== ''
+    ? session.header.cwd
+    : undefined
+  if (cwd === undefined) return jsonResponse(409, { error: '这个会话没有工作区目录，暂时不能保存' })
+
+  let realRoot
+  try {
+    realRoot = await realpath(cwd)
+  } catch (error) {
+    return jsonResponse(409, { error: `找不到工作区目录：${describeError(error)}` })
+  }
+
+  const folder = join(realRoot, NOTE_FOLDER)
+  let realFolder
+  try {
+    await mkdir(folder, { recursive: true })
+    realFolder = await realpath(folder)
+  } catch (error) {
+    return jsonResponse(500, { error: `保存目录不可用：${describeError(error)}` })
+  }
+  if (!insideRoot(realRoot, realFolder)) {
+    return jsonResponse(409, { error: `保存目录不在工作区内：${NOTE_FOLDER}` })
+  }
+
+  const concept = payload.concept.trim()
+  const markdown = renderNoteMarkdown({
+    concept,
+    turns: payload.turns,
+    snippets: payload.snippets,
+    sessionId: payload.sessionId,
+    savedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
+  })
+
+  const base = noteFileName(concept)
+  for (let attempt = 1; attempt <= 50; attempt += 1) {
+    const name = attempt === 1 ? base : base.replace(/\.md$/u, `-${attempt}.md`)
+    const target = join(realFolder, name)
+    if (!insideRoot(realFolder, target)) return jsonResponse(409, { error: '文件名不合法' })
+    try {
+      await writeFile(target, markdown, { encoding: 'utf8', flag: 'wx' })
+      return jsonResponse(200, { saved: true, relative: `${NOTE_FOLDER}/${name}`, path: target })
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return jsonResponse(500, { error: `写入失败：${describeError(error)}` })
+    }
+  }
+  return jsonResponse(409, { error: '同名文件太多，请稍后再试' })
+}
+
+/**
+ * Host plugin body: own the panel's `/api` routes for its lifetime.
  * @param ctx - host context.
  */
 export function apply(ctx) {
@@ -266,15 +356,21 @@ export function apply(ctx) {
     console.warn('[concept-explainer] no connection service; the panel endpoint stays unregistered')
     return
   }
-  const registered = connection.fetch.register({
-    path: ROUTE_PATH,
-    methods: ['POST'],
-    requestBody: 'buffered',
-    fetch: request => handleRequest(ctx, request),
-  })
-  ctx.effect(() => () => {
-    void Promise.resolve(registered)
-      .then(dispose => dispose())
-      .catch((error) => { console.warn('[concept-explainer] endpoint release failed:', error) })
-  }, 'concept-explainer: /api endpoint')
+  const routes = [
+    { path: ROUTE_PATH, fetch: request => handleRequest(ctx, request) },
+    { path: SAVE_ROUTE_PATH, fetch: request => handleSave(ctx, request) },
+  ]
+  for (const route of routes) {
+    const registered = connection.fetch.register({
+      path: route.path,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: route.fetch,
+    })
+    ctx.effect(() => () => {
+      void Promise.resolve(registered)
+        .then(dispose => dispose())
+        .catch((error) => { console.warn('[concept-explainer] endpoint release failed:', error) })
+    }, `concept-explainer: ${route.path}`)
+  }
 }

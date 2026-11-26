@@ -183,3 +183,106 @@ export function validatePayload(payload) {
   }
   return undefined
 }
+
+/** Folder created inside the workspace for saved explanations. */
+export const NOTE_FOLDER = 'concept-notes'
+
+/** Longest saved note accepted, in characters. */
+export const MAX_NOTE_CHARS = 400_000
+
+/** Longest file-name slug taken from the concept. */
+const MAX_SLUG_CHARS = 40
+
+/** Two-digit month/day padding. */
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+/**
+ * Build the note's file name: a date plus a filesystem-safe concept slug.
+ * @param concept - the explained term.
+ * @param date - the save time (defaults to now).
+ * @returns a `yyyy-mm-dd-<slug>.md` name that never contains a path separator.
+ */
+export function noteFileName(concept, date = new Date()) {
+  const stamp = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+  const raw = typeof concept === 'string' ? concept : ''
+  const slug = raw
+    .replace(/[\\/:*?"<>|\u0000-\u001F]/gu, ' ')
+    .replace(/\s+/gu, '-')
+    .replace(/^[-.]+|[-.]+$/gu, '')
+    .slice(0, MAX_SLUG_CHARS)
+  return `${stamp}-${slug === '' ? 'concept' : slug}.md`
+}
+
+/**
+ * Render one saved conversation as Markdown.
+ * @param options - concept, transcript turns, referenced snippets, session id and save time.
+ * @returns the note's complete Markdown text.
+ */
+export function renderNoteMarkdown({ concept, turns, snippets, sessionId, savedAt }) {
+  const rows = (Array.isArray(turns) ? turns : [])
+    .filter(row => row !== null && typeof row === 'object'
+      && (row.role === 'user' || row.role === 'assistant')
+      && typeof row.text === 'string' && row.text.trim() !== '')
+    .map(row => ({ role: row.role, text: row.text.trim() }))
+
+  const lines = [`# ${concept}`, '']
+  lines.push('> 由「概念解释器」从对话中整理，原对话未做任何修改。', '')
+  lines.push(`- 保存时间：${savedAt}`)
+  if (typeof sessionId === 'string' && sessionId !== '') lines.push(`- 来源会话：${sessionId}`)
+  lines.push('')
+
+  const firstAnswer = rows.findIndex(row => row.role === 'assistant')
+  const explanation = firstAnswer === -1 ? '' : rows[firstAnswer].text
+  const rest = firstAnswer === -1 ? rows : rows.slice(firstAnswer + 1)
+
+  lines.push('## 解释', '', explanation === '' ? '（没有保存到解释正文）' : explanation, '')
+
+  if (rest.length > 0) {
+    lines.push('## 追问', '')
+    for (const row of rest) {
+      lines.push(row.role === 'user' ? `**问：** ${row.text}` : `**答：** ${row.text}`, '')
+    }
+  }
+
+  const refs = (Array.isArray(snippets) ? snippets : [])
+    .filter(row => row !== null && typeof row === 'object'
+      && (row.role === 'user' || row.role === 'assistant')
+      && typeof row.preview === 'string' && row.preview !== '')
+  if (refs.length > 0) {
+    lines.push('## 引用的对话片段', '')
+    for (const row of refs) {
+      lines.push(`> **${row.role === 'assistant' ? '助手' : '用户'}**：${row.preview}`)
+    }
+    lines.push('')
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Validate one save payload; returns a Chinese error message or undefined.
+ * @param payload - parsed JSON body from the browser.
+ * @returns a human-readable rejection, or undefined when acceptable.
+ */
+export function validateSavePayload(payload) {
+  if (payload === null || typeof payload !== 'object') return '请求格式不正确'
+  if (typeof payload.sessionId !== 'string' || payload.sessionId === '') return '缺少会话标识'
+  if (typeof payload.concept !== 'string' || payload.concept.trim() === '') return '缺少要保存的概念'
+  if (payload.concept.length > MAX_CONCEPT_CHARS) return '概念太长，无法作为文件名'
+  if (!Array.isArray(payload.turns)) return '缺少要保存的内容'
+  if (payload.turns.length > MAX_TURNS * 2) return '内容过长'
+  let total = 0
+  for (const row of payload.turns) {
+    if (row === null || typeof row !== 'object') return '内容格式不正确'
+    if (row.role !== 'user' && row.role !== 'assistant') return '内容格式不正确'
+    if (typeof row.text !== 'string') return '内容格式不正确'
+    total += row.text.length
+  }
+  if (total === 0) return '还没有可以保存的内容'
+  if (total > MAX_NOTE_CHARS) return '内容过长'
+  if (payload.snippets !== undefined && payload.snippets !== null) {
+    if (!Array.isArray(payload.snippets) || payload.snippets.length > 20) return '引用片段过多'
+  }
+  return undefined
+}

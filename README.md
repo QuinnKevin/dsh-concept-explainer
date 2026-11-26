@@ -13,7 +13,18 @@ Select an unfamiliar term in a DeepSeek Harness conversation and get an explanat
 3. The right sidebar opens the **Concept explainer** tab, streams the answer, and lists which conversation fragments it used.
 4. Keep asking follow-ups at the bottom: Enter sends, Shift+Enter adds a line.
 5. **Customize prompt** at the top of the tab edits the system prompt sent to the model. Saved changes apply to later answers; **Restore default** brings back the built-in rules.
-6. The tab is also listed in the sidebar's `+` menu; its empty state explains how to start.
+6. **Save** at the top writes the whole panel conversation — explanation, follow-ups and the referenced fragments — as a Markdown note in the workspace. The panel then shows the file name.
+7. The tab is also listed in the sidebar's `+` menu; its empty state explains how to start.
+
+## Saving a note
+
+A good explanation should not disappear when the tab closes. **Save** writes one Markdown file into the workspace of the conversation the panel belongs to:
+
+- Location: `<workspace>/concept-notes/yyyy-mm-dd-<concept>.md`
+- Contents: the explanation, every follow-up question and answer, the referenced conversation fragments, the save time and the source session
+- Existing files are never overwritten: a second save in the same day becomes `…-2.md`, then `…-3.md`
+- Nothing is written until you press Save; unsaved conversations stay in the panel's memory only
+- The note is an ordinary Markdown file, so it shows up in the workspace file tree and can be edited, committed or deleted like any other file
 
 ## Why the conversation stays untouched
 
@@ -31,6 +42,7 @@ Select an unfamiliar term in a DeepSeek Harness conversation and get an explanat
 | Right-sidebar tab | `client.js` | `ctx.sidebarRightTabs.register` + `ctx.sidebarRight.openTab` + the `sidebar.right.pane.tab[.title]` seats |
 | Explanation | `index.js` | `ctx.connection.fetch.register` + `ctx.llm.stream` (the conversation's model, falling back to the default model) |
 | Context | `prompt.js` | `ctx.sessions.get(id).deriveMessages()`, read-only |
+| Saved note | `index.js` | writes `<session cwd>/concept-notes/*.md` with Node's `fs`; the destination is fixed by the host, never chosen by the request |
 | Custom prompt | `client.js` + `index.js` | the browser's `localStorage` holds the user's replacement system prompt and sends it with each request; an empty value falls back to the built-in rules |
 
 `index.js` and `prompt.js` import no Harness package: plain ESM plus the platform's own `Request` / `Response` / `ReadableStream`.
@@ -55,4 +67,5 @@ node test/client.test.mjs
 - The custom prompt lives in this browser's `localStorage`. It does not sync across devices and is never written into DSH settings or the session log.
 - A custom prompt **replaces** the built-in explanation rules. Conversation fragments are still delivered as read-only context inside the user message, so conversation text is never treated as instructions.
 - Explanations render as plain text with line breaks preserved; Markdown code blocks are not rendered.
+- A saved note goes to the conversation's workspace only; there is no workspace picker in this version.
 - No web search or dictionary lookup: the answer comes from the model and the conversation. Unknown concepts are reported as such rather than invented.
