@@ -40,12 +40,12 @@ A good explanation should not disappear when the tab closes. **Save** writes one
 - Nothing is written until you press Save; unsaved conversations stay in the panel's memory only
 - The note is an ordinary Markdown file, so it shows up in the workspace file tree and can be edited, committed or deleted like any other file
 
-## Why the conversation stays untouched
+## Why the original conversation stays untouched
 
 - Requests go to the plugin's own `POST /api/concept-explainer/stream`, which only **reads** the session's messages as context.
-- The answer is written into the tab's React state only; no message is appended to the host session log.
+- Until you branch the panel into a session, the answer is written into the tab's React state only; no message is appended to the original conversation's log.
 - The transcript lives in the panel's memory. Switching tabs keeps it (the tab stays mounted); restarting Harness clears it.
-- The panel header always states: "Reads conversation fragments as context only; never writes to the conversation".
+- The panel header states which mode it is in: before a branch it reads only, and once linked it says that follow-ups asked here are written into that session.
 
 ## How it is built
 
